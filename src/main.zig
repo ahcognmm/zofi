@@ -1,10 +1,21 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 const core = @import("core");
-const wayland_backend = @import("platform/wayland/backend.zig");
 
-const Show = wayland_backend.LauncherMode;
+const is_macos = builtin.os.tag == .macos;
+/// AppKit on macOS, Wayland everywhere else. Both expose the same `run`.
+const backend = if (is_macos)
+    @import("platform/macos/backend.zig")
+else
+    @import("platform/wayland/backend.zig");
+
+const Show = core.mode.LauncherMode;
+
+/// What a URL-shaped query gets handed to unless `$ZOFI_BROWSER` says
+/// otherwise. macOS's `open` goes to the user's default browser.
+const default_browser = if (is_macos) "open" else "firefox";
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -76,11 +87,14 @@ pub fn main(init: std.process.Init) !void {
     if (show) |mode| {
         const terminal_cmd = environ.get("TERMINAL") orelse "xterm";
         const entries = switch (mode) {
-            .drun => try core.sources.desktop.scan(arena, io, environ, terminal_cmd),
+            .drun => if (is_macos)
+                try core.sources.macapps.scan(arena, io, environ)
+            else
+                try core.sources.desktop.scan(arena, io, environ, terminal_cmd),
             .run => try core.sources.path.scan(arena, io, environ),
-            // Nothing to scan up front: the live window list only exists
-            // once wlr-foreign-toplevel-management is bound, which
-            // happens inside wayland_backend.run() itself.
+            // Nothing to scan up front: the backend builds the window list
+            // itself inside run() (on Wayland it only exists once
+            // wlr-foreign-toplevel-management is bound).
             .windows => &.{},
         };
         try runLauncher(arena, io, environ, entries, mode, terminal_cmd, debug);
@@ -103,11 +117,7 @@ fn defaultTheme(arena: std.mem.Allocator, io: Io) !core.theme.Theme {
     // A monospace font makes approxCharWidth's per-char advance estimate
     // (theme.zig) exact instead of approximate, which is what keeps the
     // cursor, truncation and query-viewport scrolling pixel-accurate.
-    theme.font_path = (try core.font.fcMatch(arena, io, "monospace")) orelse
-        (try core.font.find(arena, io, &.{ "DejaVuSansMono", "Mono", "Consolas", "Menlo" })) orelse
-        (try core.font.find(arena, io, &.{ "DejaVuSans", "Inter", "Noto", "Liberation" })) orelse
-        (try core.font.fcMatch(arena, io, "sans-serif")) orelse
-        (try core.font.findAny(arena, io));
+    theme.font_path = try core.font.findDefault(arena, io);
     return theme;
 }
 
@@ -121,7 +131,7 @@ fn runDmenu(arena: std.mem.Allocator, io: Io, entries: []const core.state.Entry,
     theme.placeholder = "Filter";
     theme.dmenu_prompt = prompt;
 
-    const chosen = try wayland_backend.run(arena, io, theme, entries, .{ .debug = debug });
+    const chosen = try backend.run(arena, io, theme, entries, .{ .debug = debug });
     const entry = chosen orelse std.process.exit(1);
 
     var stdout_buffer: [4 * 1024]u8 = undefined;
@@ -144,7 +154,7 @@ fn runLauncher(
 ) !void {
     var theme = try defaultTheme(arena, io);
     theme.show_tabs = true;
-    theme.browser_cmd = environ.get("ZOFI_BROWSER") orelse "firefox";
+    theme.browser_cmd = environ.get("ZOFI_BROWSER") orelse default_browser;
     switch (mode) {
         .drun => {
             theme.compact_rows = false;
@@ -163,7 +173,7 @@ fn runLauncher(
         },
     }
 
-    const chosen = try wayland_backend.run(arena, io, theme, entries, .{
+    const chosen = try backend.run(arena, io, theme, entries, .{
         .debug = debug,
         .mode = mode,
         .environ = environ,
@@ -172,8 +182,9 @@ fn runLauncher(
     const entry = chosen orelse std.process.exit(1);
 
     // Windows mode already focused the window itself, inside run(), while
-    // the Wayland connection was still open -- there's nothing left to
-    // shell out to here, and entry.action isn't even a command.
+    // the Wayland connection (or AppKit session) was still open -- there's
+    // nothing left to shell out to here, and entry.action isn't even a
+    // command.
     if (mode == .windows) return;
 
     if (entry.is_url) {
@@ -202,5 +213,5 @@ fn runRankHarness(arena: std.mem.Allocator, io: Io, entries: []const core.state.
 }
 
 test {
-    _ = wayland_backend;
+    _ = backend;
 }

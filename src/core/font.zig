@@ -1,16 +1,28 @@
 //! Font discovery: scan the standard font directories for a file whose name
 //! contains one of the preferred family substrings (case-insensitive).
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
+const z2d = @import("z2d");
 
 const standard_dirs = [_][]const u8{
     "/usr/share/fonts",
     "/usr/local/share/fonts",
     "/run/current-system/sw/share/fonts",
+    // macOS (walked recursively, so this also covers .../Fonts/Supplemental)
+    "/System/Library/Fonts",
+    "/Library/Fonts",
 };
 
+/// Monospace fonts every macOS install ships as plain single-font `.ttf`
+/// files, most preferred first. Menlo, the usual pick, only ships as a
+/// `.ttc` collection, which z2d can't load (see `hasFontExt`).
+const macos_monospace = [_][]const u8{ "Monaco", "SFNSMono", "Andale Mono", "Courier New" };
+
 fn hasFontExt(name: []const u8) bool {
-    const exts = [_][]const u8{ ".ttf", ".otf", ".ttc" };
+    // No ".ttc": z2d only loads single-font files, and a collection would
+    // leave the UI with no text at all rather than falling back.
+    const exts = [_][]const u8{ ".ttf", ".otf" };
     for (exts) |ext| {
         if (name.len >= ext.len and std.ascii.eqlIgnoreCase(name[name.len - ext.len ..], ext)) return true;
     }
@@ -81,9 +93,36 @@ pub fn fcMatch(allocator: std.mem.Allocator, io: Io, family: []const u8) !?[]u8 
     }) catch return null;
     defer allocator.free(result.stderr);
 
-    if (result.term != .exited or result.term.exited != 0 or result.stdout.len == 0) {
+    if (result.term != .exited or result.term.exited != 0 or result.stdout.len == 0 or !hasFontExt(result.stdout)) {
         allocator.free(result.stdout);
         return null;
     }
     return result.stdout;
+}
+
+/// The font `zofi` renders with unless configured otherwise: a real
+/// monospace font first (see `Theme.font_path` for why), then any sans,
+/// then anything at all, so the UI always has something to draw text with.
+pub fn findDefault(allocator: std.mem.Allocator, io: Io) !?[]u8 {
+    if (builtin.os.tag == .macos) {
+        // One family per call: `find` returns the first match in directory
+        // order, which would otherwise ignore this list's preference order.
+        for (macos_monospace) |family| {
+            if (try find(allocator, io, &.{family})) |path| return path;
+        }
+    }
+    return (try fcMatch(allocator, io, "monospace")) orelse
+        (try find(allocator, io, &.{ "DejaVuSansMono", "Mono", "Consolas", "Menlo" })) orelse
+        (try find(allocator, io, &.{ "DejaVuSans", "Inter", "Noto", "Liberation" })) orelse
+        (try fcMatch(allocator, io, "sans-serif")) orelse
+        (try findAny(allocator, io));
+}
+
+test "findDefault picks a font z2d can actually load" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = (try findDefault(allocator, io)) orelse return error.SkipZigTest;
+    defer allocator.free(path);
+    var font = try z2d.Font.loadFile(io, allocator, path);
+    font.deinit(allocator);
 }

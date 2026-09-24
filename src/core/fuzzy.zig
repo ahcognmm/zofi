@@ -235,7 +235,7 @@ test "scoreWithPositions finds matched indices" {
     var positions: [3]usize = undefined;
     const s = try scoreWithPositions(&scratch, "fbr", "foo/bar", &positions);
     try std.testing.expect(s > SCORE_MIN);
-    try std.testing.expectEqualSlices(usize, &.{ 0, 4, 5 }, &positions);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 4, 6 }, &positions);
 }
 
 test "scratch is reused across many candidates without leaking" {

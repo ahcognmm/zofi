@@ -105,27 +105,7 @@ pub const App = struct {
     icon_cache: ?core.icon.Cache = null,
 };
 
-pub const LauncherMode = enum {
-    drun,
-    run,
-    windows,
-
-    fn next(self: LauncherMode) LauncherMode {
-        return switch (self) {
-            .drun => .run,
-            .run => .windows,
-            .windows => .drun,
-        };
-    }
-
-    fn prev(self: LauncherMode) LauncherMode {
-        return switch (self) {
-            .drun => .windows,
-            .run => .drun,
-            .windows => .run,
-        };
-    }
-};
+pub const LauncherMode = core.mode.LauncherMode;
 
 /// Logs to stderr when `ZOFI_DEBUG` is set, so a hang/freeze can be
 /// diagnosed from what the log stops after, not guessed at. No-op (and the
