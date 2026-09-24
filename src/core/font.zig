@@ -55,7 +55,10 @@ pub fn find(allocator: std.mem.Allocator, io: Io, family_substrings: []const []c
 
             for (family_substrings) |family| {
                 if (containsIgnoreCase(entry.basename, family)) {
-                    return try std.fs.path.join(allocator, &.{ dir_path, entry.path });
+                    const path = try std.fs.path.join(allocator, &.{ dir_path, entry.path });
+                    if (isLoadable(allocator, io, path)) return path;
+                    allocator.free(path);
+                    break;
                 }
             }
         }
@@ -77,10 +80,26 @@ pub fn findAny(allocator: std.mem.Allocator, io: Io) !?[]u8 {
         while (try walker.next(io)) |entry| {
             if (entry.kind != .file) continue;
             if (!hasFontExt(entry.basename)) continue;
-            return try std.fs.path.join(allocator, &.{ dir_path, entry.path });
+            const path = try std.fs.path.join(allocator, &.{ dir_path, entry.path });
+            if (isLoadable(allocator, io, path)) return path;
+            allocator.free(path);
         }
     }
     return null;
+}
+
+/// Whether z2d can actually parse the font at `path`. A font that fails
+/// here (a collection, CFF outlines, a table z2d rejects) would otherwise
+/// be picked anyway and leave the UI with no text at all, so discovery
+/// checks every candidate and moves on to the next one instead. Reads the
+/// file itself rather than using `z2d.Font.loadFile`, which leaks its
+/// buffer when parsing fails.
+fn isLoadable(allocator: std.mem.Allocator, io: Io, path: []const u8) bool {
+    if (!hasFontExt(path)) return false;
+    const data = Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch return false;
+    defer allocator.free(data);
+    _ = z2d.Font.loadBuffer(data) catch return false;
+    return true;
 }
 
 /// Asks fontconfig for a concrete file path for `family` (e.g. "sans-serif").
@@ -93,7 +112,7 @@ pub fn fcMatch(allocator: std.mem.Allocator, io: Io, family: []const u8) !?[]u8 
     }) catch return null;
     defer allocator.free(result.stderr);
 
-    if (result.term != .exited or result.term.exited != 0 or result.stdout.len == 0 or !hasFontExt(result.stdout)) {
+    if (result.term != .exited or result.term.exited != 0 or result.stdout.len == 0 or !isLoadable(allocator, io, result.stdout)) {
         allocator.free(result.stdout);
         return null;
     }
@@ -123,6 +142,19 @@ test "findDefault picks a font z2d can actually load" {
     const io = std.testing.io;
     const path = (try findDefault(allocator, io)) orelse return error.SkipZigTest;
     defer allocator.free(path);
-    var font = try z2d.Font.loadFile(io, allocator, path);
-    font.deinit(allocator);
+    try std.testing.expect(isLoadable(allocator, io, path));
+}
+
+test "isLoadable rejects a file z2d can't parse, without leaking" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A valid TrueType header declaring zero tables: z2d rejects it with
+    // MissingRequiredTable, the same kind of error a real font it can't
+    // handle produces.
+    try tmp.dir.writeFile(io, .{ .sub_path = "Broken.ttf", .data = "\x00\x01\x00\x00" ++ "\x00" ** 8 });
+    const path = try tmp.dir.realPathFileAlloc(io, "Broken.ttf", allocator);
+    defer allocator.free(path);
+    try std.testing.expect(!isLoadable(allocator, io, path));
 }
