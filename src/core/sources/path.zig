@@ -25,7 +25,8 @@ pub fn scan(allocator: std.mem.Allocator, io: Io, environ: *const std.process.En
 
             const name = try allocator.dupe(u8, entry.name);
             try seen.put(allocator, name, {});
-            try entries.append(allocator, .{ .label = name });
+            const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+            try entries.append(allocator, .{ .label = name, .action = full_path });
         }
     }
 

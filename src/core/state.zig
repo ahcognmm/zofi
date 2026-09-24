@@ -5,8 +5,16 @@ const fuzzy = @import("fuzzy.zig");
 
 pub const Entry = struct {
     label: []const u8,
-    /// What to hand back on accept, if different from `label`.
+    /// What to hand back on accept, if different from `label`. Also shown
+    /// as right-aligned secondary text in compact (Run/dmenu) rows when it
+    /// differs from `label`.
     action: ?[]const u8 = null,
+    /// Shown below the name in tall (Apps/Windows) rows, e.g. "Web Browser".
+    subtitle: ?[]const u8 = null,
+    /// Freedesktop icon name (the `.desktop` file's `Icon=`), resolved and
+    /// decoded lazily by `core.icon.Cache`. Falls back to the colored
+    /// letter tile when null or unresolvable.
+    icon_name: ?[]const u8 = null,
 };
 
 pub const Result = struct {
@@ -18,6 +26,8 @@ pub const NamedKey = enum {
     escape,
     enter,
     backspace,
+    left,
+    right,
     up,
     down,
     page_up,
@@ -42,6 +52,9 @@ pub const State = struct {
     allocator: std.mem.Allocator,
     entries: []const Entry,
     query: std.ArrayList(u8) = .empty,
+    /// Byte offset into `query.items`, always on a UTF-8 boundary. Where
+    /// text gets inserted and what backspace/Ctrl+W delete.
+    cursor: usize = 0,
     results: std.ArrayList(Result) = .empty,
     selected: usize = 0,
     scroll: usize = 0,
@@ -68,6 +81,7 @@ pub const State = struct {
     pub fn setQuery(self: *State, text: []const u8) !void {
         self.query.clearRetainingCapacity();
         try self.query.appendSlice(self.allocator, text);
+        self.cursor = self.query.items.len;
         try self.rescore();
     }
 
@@ -79,12 +93,30 @@ pub const State = struct {
     pub fn handleKey(self: *State, ev: KeyEvent) !Action {
         switch (ev) {
             .named => |k| switch (k) {
-                .escape => return .cancel,
+                .escape => {
+                    if (self.query.items.len == 0) return .cancel;
+                    self.query.clearRetainingCapacity();
+                    self.cursor = 0;
+                    try self.rescore();
+                    return .redraw;
+                },
                 .enter => return .accept,
                 .backspace => {
-                    if (self.query.items.len == 0) return .nothing;
-                    self.query.shrinkRetainingCapacity(prevUtf8Boundary(self.query.items));
+                    if (self.cursor == 0) return .nothing;
+                    const start = prevUtf8Boundary(self.query.items[0..self.cursor]);
+                    self.query.replaceRangeAssumeCapacity(start, self.cursor - start, &.{});
+                    self.cursor = start;
                     try self.rescore();
+                    return .redraw;
+                },
+                .left => {
+                    if (self.cursor == 0) return .nothing;
+                    self.cursor = prevUtf8Boundary(self.query.items[0..self.cursor]);
+                    return .redraw;
+                },
+                .right => {
+                    if (self.cursor >= self.query.items.len) return .nothing;
+                    self.cursor += std.unicode.utf8ByteSequenceLength(self.query.items[self.cursor]) catch 1;
                     return .redraw;
                 },
                 .up => {
@@ -104,25 +136,26 @@ pub const State = struct {
                     return .redraw;
                 },
                 .home => {
-                    self.selected = 0;
-                    self.fixScroll();
+                    if (self.cursor == 0) return .nothing;
+                    self.cursor = 0;
                     return .redraw;
                 },
                 .end => {
-                    if (self.results.items.len > 0) self.selected = self.results.items.len - 1;
-                    self.fixScroll();
+                    if (self.cursor >= self.query.items.len) return .nothing;
+                    self.cursor = self.query.items.len;
                     return .redraw;
                 },
                 .tab => return .nothing,
             },
             .ctrl => |c| switch (c) {
                 .w => {
-                    self.deleteTrailingWord();
+                    self.deleteWordBeforeCursor();
                     try self.rescore();
                     return .redraw;
                 },
                 .u => {
                     self.query.clearRetainingCapacity();
+                    self.cursor = 0;
                     try self.rescore();
                     return .redraw;
                 },
@@ -137,7 +170,8 @@ pub const State = struct {
             },
             .text => |bytes| {
                 if (bytes.len == 0) return .nothing;
-                try self.query.appendSlice(self.allocator, bytes);
+                try self.query.insertSlice(self.allocator, self.cursor, bytes);
+                self.cursor += bytes.len;
                 try self.rescore();
                 return .redraw;
             },
@@ -193,11 +227,12 @@ pub const State = struct {
         }
     }
 
-    fn deleteTrailingWord(self: *State) void {
-        var end = self.query.items.len;
-        while (end > 0 and self.query.items[end - 1] == ' ') end -= 1;
-        while (end > 0 and self.query.items[end - 1] != ' ') end -= 1;
-        self.query.shrinkRetainingCapacity(end);
+    fn deleteWordBeforeCursor(self: *State) void {
+        var start = self.cursor;
+        while (start > 0 and self.query.items[start - 1] == ' ') start -= 1;
+        while (start > 0 and self.query.items[start - 1] != ' ') start -= 1;
+        self.query.replaceRangeAssumeCapacity(start, self.cursor - start, &.{});
+        self.cursor = start;
     }
 };
 
@@ -268,17 +303,75 @@ test "navigation clamps at the edges" {
     defer s.deinit();
     _ = try s.handleKey(.{ .named = .up });
     try std.testing.expectEqual(@as(usize, 0), s.selected);
-    _ = try s.handleKey(.{ .named = .end });
+    _ = try s.handleKey(.{ .named = .page_down });
     try std.testing.expectEqual(@as(usize, 3), s.selected);
     _ = try s.handleKey(.{ .named = .down });
     try std.testing.expectEqual(@as(usize, 3), s.selected);
-    _ = try s.handleKey(.{ .named = .home });
+    _ = try s.handleKey(.{ .named = .page_up });
     try std.testing.expectEqual(@as(usize, 0), s.selected);
+}
+
+test "left/right move the cursor, clamped at the edges" {
+    var s = try State.init(std.testing.allocator, testEntries());
+    defer s.deinit();
+    try s.setQuery("abc");
+    try std.testing.expectEqual(@as(usize, 3), s.cursor);
+    _ = try s.handleKey(.{ .named = .right });
+    try std.testing.expectEqual(@as(usize, 3), s.cursor); // already at end
+    _ = try s.handleKey(.{ .named = .left });
+    _ = try s.handleKey(.{ .named = .left });
+    try std.testing.expectEqual(@as(usize, 1), s.cursor);
+    _ = try s.handleKey(.{ .named = .left });
+    _ = try s.handleKey(.{ .named = .left });
+    try std.testing.expectEqual(@as(usize, 0), s.cursor); // clamped
+}
+
+test "home/end move the cursor to the start/end of the query" {
+    var s = try State.init(std.testing.allocator, testEntries());
+    defer s.deinit();
+    try s.setQuery("abc");
+    _ = try s.handleKey(.{ .named = .home });
+    try std.testing.expectEqual(@as(usize, 0), s.cursor);
+    _ = try s.handleKey(.{ .named = .end });
+    try std.testing.expectEqual(@as(usize, 3), s.cursor);
+}
+
+test "text inserts at the cursor, not always at the end" {
+    var s = try State.init(std.testing.allocator, testEntries());
+    defer s.deinit();
+    try s.setQuery("ac");
+    _ = try s.handleKey(.{ .named = .left });
+    _ = try s.handleKey(.{ .text = "b" });
+    try std.testing.expectEqualStrings("abc", s.query.items);
+    try std.testing.expectEqual(@as(usize, 2), s.cursor);
+}
+
+test "backspace deletes before the cursor, not always the last char" {
+    var s = try State.init(std.testing.allocator, testEntries());
+    defer s.deinit();
+    try s.setQuery("abc");
+    _ = try s.handleKey(.{ .named = .left });
+    _ = try s.handleKey(.{ .named = .backspace });
+    try std.testing.expectEqualStrings("ac", s.query.items);
+    try std.testing.expectEqual(@as(usize, 1), s.cursor);
 }
 
 test "enter and escape report accept/cancel" {
     var s = try State.init(std.testing.allocator, testEntries());
     defer s.deinit();
     try std.testing.expectEqual(Action.accept, try s.handleKey(.{ .named = .enter }));
+    try std.testing.expectEqual(Action.cancel, try s.handleKey(.{ .named = .escape }));
+}
+
+test "escape clears a non-empty query before it cancels" {
+    var s = try State.init(std.testing.allocator, testEntries());
+    defer s.deinit();
+    _ = try s.handleKey(.{ .text = "fire" });
+
+    try std.testing.expectEqual(Action.redraw, try s.handleKey(.{ .named = .escape }));
+    try std.testing.expectEqual(@as(usize, 0), s.query.items.len);
+    try std.testing.expectEqual(@as(usize, 0), s.cursor);
+    try std.testing.expectEqual(@as(usize, 4), s.results.items.len); // back to unfiltered
+
     try std.testing.expectEqual(Action.cancel, try s.handleKey(.{ .named = .escape }));
 }

@@ -2,9 +2,27 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // Debug mode crashes the Zig 0.16.0 compiler itself when zigimg (PNG
+    // icon decoding) is in the build -- confirmed with a minimal
+    // reproduction outside this project entirely, so it's an upstream
+    // compiler/library interaction, not fixable here. ReleaseSafe doesn't
+    // trip it, and it's also just the right default for a launcher whose
+    // main requirement is fast startup. Override with -Doptimize=Debug if
+    // you ever need to and zigimg isn't the thing you're debugging.
+    // (standardOptimizeOption's `preferred_optimize_mode` doesn't actually
+    // change the bare `zig build` default -- it only changes what
+    // `--release` resolves to -- so it's not used here.)
+    const optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size",
+    ) orelse .ReleaseSafe;
 
     const z2d = b.dependency("z2d", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zigimg = b.dependency("zigimg", .{
         .target = target,
         .optimize = optimize,
     });
@@ -15,6 +33,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "z2d", .module = z2d.module("z2d") },
+            .{ .name = "zigimg", .module = zigimg.module("zigimg") },
         },
     });
 
@@ -99,11 +118,14 @@ fn addWaylandBackend(
 
     const xdg_shell = scanProtocol(b, scanner, b.path("protocols/xdg-shell.xml"), "xdg-shell");
     const layer_shell = scanProtocol(b, scanner, b.path("protocols/wlr-layer-shell-unstable-v1.xml"), "wlr-layer-shell-unstable-v1");
+    const foreign_toplevel = scanProtocol(b, scanner, b.path("protocols/wlr-foreign-toplevel-management-unstable-v1.xml"), "wlr-foreign-toplevel-management-unstable-v1");
 
     mod.addCSourceFile(.{ .file = xdg_shell.code, .flags = &.{} });
     mod.addCSourceFile(.{ .file = layer_shell.code, .flags = &.{} });
+    mod.addCSourceFile(.{ .file = foreign_toplevel.code, .flags = &.{} });
     mod.addIncludePath(xdg_shell.header.dirname());
     mod.addIncludePath(layer_shell.header.dirname());
+    mod.addIncludePath(foreign_toplevel.header.dirname());
 
     _ = target;
 }

@@ -5,6 +5,7 @@ pub const state = @import("state.zig");
 pub const theme = @import("theme.zig");
 pub const render = @import("render.zig");
 pub const font = @import("font.zig");
+pub const icon = @import("icon.zig");
 pub const launch = @import("launch.zig");
 
 pub const sources = struct {

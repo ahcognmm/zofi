@@ -14,8 +14,21 @@ pub const c = @cImport({
     @cInclude("wayland-client.h");
     @cInclude("xdg-shell-client-protocol.h");
     @cInclude("wlr-layer-shell-unstable-v1-client-protocol.h");
+    @cInclude("wlr-foreign-toplevel-management-unstable-v1-client-protocol.h");
     @cInclude("xkbcommon/xkbcommon.h");
 });
+
+/// A live open window, tracked via wlr-foreign-toplevel-management. Heap
+/// allocated individually (not stored by value in a resizable list) since
+/// its address is handed to Wayland as listener userdata and must stay
+/// stable across appends elsewhere.
+const Toplevel = struct {
+    allocator: std.mem.Allocator,
+    handle: *c.zwlr_foreign_toplevel_handle_v1,
+    title: []u8 = &.{},
+    app_id: []u8 = &.{},
+    closed: bool = false,
+};
 
 const Buffer = struct {
     wl_buffer: ?*c.wl_buffer = null,
@@ -37,6 +50,7 @@ pub const App = struct {
     seat: ?*c.wl_seat = null,
     layer_shell: ?*c.zwlr_layer_shell_v1 = null,
     xdg_wm_base: ?*c.xdg_wm_base = null,
+    toplevel_manager: ?*c.zwlr_foreign_toplevel_manager_v1 = null,
 
     surface: ?*c.wl_surface = null,
     layer_surface: ?*c.zwlr_layer_surface_v1 = null,
@@ -67,7 +81,59 @@ pub const App = struct {
 
     running: bool = true,
     accepted: ?core.state.Entry = null,
+
+    /// Set from `ZOFI_DEBUG` in the environment. See `dbg`.
+    debug: bool = false,
+
+    /// Non-null enables Tab/Shift+Tab mode switching (Apps/Run/Windows).
+    /// Null for dmenu, which has a single fixed entry list and no tabs.
+    mode: ?LauncherMode = null,
+    environ: ?*const std.process.Environ.Map = null,
+    terminal_cmd: []const u8 = "",
+
+    /// Live open windows, tracked continuously (not just while in Windows
+    /// mode) via wlr-foreign-toplevel-management, since events arrive
+    /// whenever the compositor sends them.
+    toplevels: std.ArrayList(*Toplevel) = .empty,
+    /// Parallel to `state.entries` only while `mode == .windows`: handle to
+    /// activate for each entry index, since `Entry` itself is backend-
+    /// agnostic and can't carry a Wayland object.
+    window_handles: []const *c.zwlr_foreign_toplevel_handle_v1 = &.{},
+
+    /// Lazily-populated real-icon lookup for Apps/Windows rows; null when
+    /// there's no environ to search with (dmenu).
+    icon_cache: ?core.icon.Cache = null,
 };
+
+pub const LauncherMode = enum {
+    drun,
+    run,
+    windows,
+
+    fn next(self: LauncherMode) LauncherMode {
+        return switch (self) {
+            .drun => .run,
+            .run => .windows,
+            .windows => .drun,
+        };
+    }
+
+    fn prev(self: LauncherMode) LauncherMode {
+        return switch (self) {
+            .drun => .windows,
+            .run => .drun,
+            .windows => .run,
+        };
+    }
+};
+
+/// Logs to stderr when `ZOFI_DEBUG` is set, so a hang/freeze can be
+/// diagnosed from what the log stops after, not guessed at. No-op (and the
+/// `args` formatting is skipped) otherwise.
+fn dbg(app: *const App, comptime fmt: []const u8, args: anytype) void {
+    if (!app.debug) return;
+    std.debug.print(fmt ++ "\n", args);
+}
 
 const registry_listener: c.wl_registry_listener = .{
     .global = registryGlobal,
@@ -77,6 +143,7 @@ const registry_listener: c.wl_registry_listener = .{
 fn registryGlobal(data: ?*anyopaque, registry: ?*c.wl_registry, name: u32, interface: [*c]const u8, version: u32) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(data.?));
     const iface = std.mem.span(interface);
+    dbg(app, "registryGlobal: {s} v{d} (name={d})", .{ iface, version, name });
 
     if (std.mem.eql(u8, iface, std.mem.span(c.wl_compositor_interface.name))) {
         app.compositor = @ptrCast(@alignCast(c.wl_registry_bind(registry, name, &c.wl_compositor_interface, @min(version, 4)).?));
@@ -90,6 +157,9 @@ fn registryGlobal(data: ?*anyopaque, registry: ?*c.wl_registry, name: u32, inter
     } else if (std.mem.eql(u8, iface, std.mem.span(c.xdg_wm_base_interface.name))) {
         app.xdg_wm_base = @ptrCast(@alignCast(c.wl_registry_bind(registry, name, &c.xdg_wm_base_interface, @min(version, 6)).?));
         _ = c.xdg_wm_base_add_listener(app.xdg_wm_base, &wm_base_listener, app);
+    } else if (std.mem.eql(u8, iface, std.mem.span(c.zwlr_foreign_toplevel_manager_v1_interface.name))) {
+        app.toplevel_manager = @ptrCast(@alignCast(c.wl_registry_bind(registry, name, &c.zwlr_foreign_toplevel_manager_v1_interface, @min(version, 3)).?));
+        _ = c.zwlr_foreign_toplevel_manager_v1_add_listener(app.toplevel_manager, &toplevel_manager_listener, app);
     }
 }
 
@@ -104,6 +174,83 @@ const wm_base_listener: c.xdg_wm_base_listener = .{ .ping = wmBasePing };
 fn wmBasePing(data: ?*anyopaque, wm_base: ?*c.xdg_wm_base, serial: u32) callconv(.c) void {
     _ = data;
     c.xdg_wm_base_pong(wm_base, serial);
+}
+
+const toplevel_manager_listener: c.zwlr_foreign_toplevel_manager_v1_listener = .{
+    .toplevel = toplevelManagerToplevel,
+    .finished = toplevelManagerFinished,
+};
+
+fn toplevelManagerToplevel(data: ?*anyopaque, manager: ?*c.zwlr_foreign_toplevel_manager_v1, handle: ?*c.zwlr_foreign_toplevel_handle_v1) callconv(.c) void {
+    _ = manager;
+    const app: *App = @ptrCast(@alignCast(data.?));
+    const t = app.allocator.create(Toplevel) catch return;
+    t.* = .{ .allocator = app.allocator, .handle = handle.? };
+    app.toplevels.append(app.allocator, t) catch {
+        app.allocator.destroy(t);
+        return;
+    };
+    _ = c.zwlr_foreign_toplevel_handle_v1_add_listener(handle, &toplevel_handle_listener, t);
+    dbg(app, "toplevel: new handle, {d} tracked", .{app.toplevels.items.len});
+}
+
+fn toplevelManagerFinished(data: ?*anyopaque, manager: ?*c.zwlr_foreign_toplevel_manager_v1) callconv(.c) void {
+    _ = data;
+    c.zwlr_foreign_toplevel_manager_v1_destroy(manager);
+}
+
+const toplevel_handle_listener: c.zwlr_foreign_toplevel_handle_v1_listener = .{
+    .title = toplevelTitle,
+    .app_id = toplevelAppId,
+    .output_enter = toplevelOutputEnter,
+    .output_leave = toplevelOutputLeave,
+    .state = toplevelState,
+    .done = toplevelDone,
+    .closed = toplevelClosed,
+    .parent = toplevelParent,
+};
+
+fn toplevelTitle(data: ?*anyopaque, handle: ?*c.zwlr_foreign_toplevel_handle_v1, title: [*c]const u8) callconv(.c) void {
+    _ = handle;
+    const t: *Toplevel = @ptrCast(@alignCast(data.?));
+    t.allocator.free(t.title);
+    t.title = t.allocator.dupe(u8, std.mem.span(title)) catch &.{};
+}
+
+fn toplevelAppId(data: ?*anyopaque, handle: ?*c.zwlr_foreign_toplevel_handle_v1, app_id: [*c]const u8) callconv(.c) void {
+    _ = handle;
+    const t: *Toplevel = @ptrCast(@alignCast(data.?));
+    t.allocator.free(t.app_id);
+    t.app_id = t.allocator.dupe(u8, std.mem.span(app_id)) catch &.{};
+}
+
+fn toplevelDone(data: ?*anyopaque, handle: ?*c.zwlr_foreign_toplevel_handle_v1) callconv(.c) void {
+    _ = handle;
+    _ = data;
+    // Nothing to do: windows-mode entries are rebuilt fresh from
+    // `app.toplevels` whenever the user switches into that mode, not kept
+    // continuously in sync with `state`.
+}
+
+fn toplevelClosed(data: ?*anyopaque, handle: ?*c.zwlr_foreign_toplevel_handle_v1) callconv(.c) void {
+    const t: *Toplevel = @ptrCast(@alignCast(data.?));
+    t.closed = true;
+    c.zwlr_foreign_toplevel_handle_v1_destroy(handle);
+}
+
+// Handle events this launcher doesn't need: which output(s) the window is
+// visible on, its maximized/minimized/activated state, and its parent.
+fn toplevelOutputEnter(data: ?*anyopaque, handle: ?*c.zwlr_foreign_toplevel_handle_v1, output: ?*c.wl_output) callconv(.c) void {
+    _ = .{ data, handle, output };
+}
+fn toplevelOutputLeave(data: ?*anyopaque, handle: ?*c.zwlr_foreign_toplevel_handle_v1, output: ?*c.wl_output) callconv(.c) void {
+    _ = .{ data, handle, output };
+}
+fn toplevelState(data: ?*anyopaque, handle: ?*c.zwlr_foreign_toplevel_handle_v1, state: ?*c.wl_array) callconv(.c) void {
+    _ = .{ data, handle, state };
+}
+fn toplevelParent(data: ?*anyopaque, handle: ?*c.zwlr_foreign_toplevel_handle_v1, parent: ?*c.zwlr_foreign_toplevel_handle_v1) callconv(.c) void {
+    _ = .{ data, handle, parent };
 }
 
 const seat_listener: c.wl_seat_listener = .{
@@ -182,14 +329,22 @@ fn keyboardKey(data: ?*anyopaque, keyboard: ?*c.wl_keyboard, serial: u32, time: 
     _ = time;
     const app: *App = @ptrCast(@alignCast(data.?));
     const pressed = state == c.WL_KEYBOARD_KEY_STATE_PRESSED;
+    dbg(app, "keyboardKey: raw_key={d} pressed={} repeat_keycode={d}", .{ key, pressed, app.repeat_keycode });
 
     if (pressed) {
-        processKeycode(app, key) catch {};
-        if (app.repeat_rate > 0) armRepeat(app, key);
+        processKeycode(app, key) catch |err| dbg(app, "processKeycode error: {t}", .{err});
+        // Tab is a one-shot mode switch, not something that makes sense to
+        // hold-and-repeat -- arming it anyway meant a single keypress with
+        // any repeat-timer/release-event delay (as little as a fast
+        // synthetic press, not even a real hold) span the repeat delay
+        // and fire cycleMode() repeatedly, spinning through every mode.
+        if (app.repeat_rate > 0 and key != evdev_key_tab) armRepeat(app, key);
     } else if (app.repeat_keycode == key) {
         disarmRepeat(app);
     }
 }
+
+const evdev_key_tab: u32 = 15;
 
 fn keyboardModifiers(
     data: ?*anyopaque,
@@ -271,11 +426,20 @@ fn bufferRelease(data: ?*anyopaque, wl_buffer: ?*c.wl_buffer) callconv(.c) void 
 
 /// Runs the launcher. On accept, returns the chosen entry (still owned by
 /// the caller-supplied `entries` slice); on cancel/close, returns `null`.
+pub const RunOptions = struct {
+    debug: bool = false,
+    /// Non-null enables Tab/Shift+Tab mode switching; see `App.mode`.
+    mode: ?LauncherMode = null,
+    environ: ?*const std.process.Environ.Map = null,
+    terminal_cmd: []const u8 = "",
+};
+
 pub fn run(
     allocator: std.mem.Allocator,
     io: Io,
     theme: core.theme.Theme,
     entries: []const core.state.Entry,
+    options: RunOptions,
 ) !?core.state.Entry {
     const display = c.wl_display_connect(null) orelse return error.NoWaylandDisplay;
     defer c.wl_display_disconnect(display);
@@ -289,17 +453,34 @@ pub fn run(
         .registry = registry,
         .theme = theme,
         .state = try core.state.State.init(allocator, entries),
+        .debug = options.debug,
+        .mode = options.mode,
+        .environ = options.environ,
+        .terminal_cmd = options.terminal_cmd,
     };
+    if (options.environ) |environ| {
+        app.icon_cache = core.icon.Cache.init(allocator, io, environ) catch null;
+    }
     defer app.state.deinit();
     // State's scroll/paging math and render()'s row count must agree on the
     // same page size, or the highlighted row and what's actually painted
     // can disagree once a config lets these diverge.
-    app.state.visible_rows = app.theme.visible_rows;
+    app.state.visible_rows = app.theme.visibleRows();
 
     _ = c.wl_registry_add_listener(registry, &registry_listener, &app);
     if (c.wl_display_roundtrip(display) == -1) return error.RoundtripFailed;
-    // Second roundtrip so seat capabilities (bound during the first) resolve too.
+    // Second roundtrip so seat capabilities (bound during the first)
+    // resolve too, and so do each toplevel handle's title/app_id/done
+    // events (bound during the first roundtrip's `toplevel` events, so
+    // their own detail events are a roundtrip behind).
     if (c.wl_display_roundtrip(display) == -1) return error.RoundtripFailed;
+
+    if (options.mode == .windows) {
+        const window_entries = buildWindowEntries(&app) catch &.{};
+        app.state.deinit();
+        app.state = try core.state.State.init(allocator, window_entries);
+        app.state.visible_rows = app.theme.visibleRows();
+    }
 
     const compositor = app.compositor orelse return error.NoCompositor;
     const shm = app.shm orelse return error.NoShm;
@@ -348,10 +529,22 @@ pub fn run(
     try createBuffers(&app);
     defer if (app.pool_map.len > 0) posix.munmap(app.pool_map);
 
-    app.timer_fd = @intCast(linux.timerfd_create(.MONOTONIC, .{}));
+    // NONBLOCK is load-bearing: poll() reporting the timer fd readable can
+    // race with disarmRepeat() (a key release processed from the *same*
+    // wakeup can disarm the timer before we get to reading it), and a
+    // blocking read() on a disarmed timerfd with nothing pending waits
+    // forever -- hanging the whole event loop, and with it all keyboard
+    // input, since this surface holds an exclusive grab.
+    app.timer_fd = @intCast(linux.timerfd_create(.MONOTONIC, .{ .NONBLOCK = true }));
     defer _ = linux.close(app.timer_fd);
 
     try eventLoop(&app);
+
+    // The loop can exit right after queuing a request (e.g. `activate()`
+    // for windows-mode accept) without another pass through its own
+    // flush() -- and disconnect() below does not flush on its own, so
+    // that request would otherwise be silently dropped.
+    _ = c.wl_display_flush(app.display);
 
     return app.accepted;
 }
@@ -400,30 +593,43 @@ fn createBuffers(app: *App) !void {
 /// display can go stale relative to `app.state`.
 fn presentFrame(app: *App) !bool {
     const buf = &app.buffers[app.cur_buffer];
-    if (buf.busy) return false; // still owned by the compositor; retry next loop
+    if (buf.busy) {
+        dbg(app, "presentFrame: buffer {d} still busy, skipping", .{app.cur_buffer});
+        return false; // still owned by the compositor; retry next loop
+    }
 
     var surface = core_z2d.Surface.initBuffer(.image_surface_argb, null, buf.pixels, app.width, app.height);
-    try core.render.render(app.io, app.allocator, &surface, &app.theme, &app.state, 1.0);
+    try core.render.render(app.io, app.allocator, &surface, &app.theme, &app.state, 1.0, if (app.icon_cache) |*cache| cache else null);
 
     c.wl_surface_attach(app.surface, buf.wl_buffer, 0, 0);
     c.wl_surface_damage_buffer(app.surface, 0, 0, app.width, app.height);
     c.wl_surface_commit(app.surface);
     buf.busy = true;
+    dbg(app, "presentFrame: presented buffer {d}", .{app.cur_buffer});
     app.cur_buffer = 1 - app.cur_buffer;
     return true;
 }
 
 fn eventLoop(app: *App) !void {
+    var iteration: u64 = 0;
     while (app.running) {
+        iteration += 1;
         if (app.need_redraw) {
             app.need_redraw = !(try presentFrame(app));
         }
 
+        var prepare_spins: u32 = 0;
         while (c.wl_display_prepare_read(app.display) != 0) {
+            prepare_spins += 1;
+            if (prepare_spins > 1000) {
+                dbg(app, "eventLoop: prepare_read spun >1000 times, bailing to avoid a true hang", .{});
+                return error.PrepareReadStuck;
+            }
             _ = c.wl_display_dispatch_pending(app.display);
         }
         _ = c.wl_display_flush(app.display);
 
+        dbg(app, "eventLoop: iter={d} polling (need_redraw={})", .{ iteration, app.need_redraw });
         var fds = [_]posix.pollfd{
             .{ .fd = c.wl_display_get_fd(app.display), .events = posix.POLL.IN, .revents = 0 },
             .{ .fd = app.timer_fd, .events = posix.POLL.IN, .revents = 0 },
@@ -432,6 +638,7 @@ fn eventLoop(app: *App) !void {
             c.wl_display_cancel_read(app.display);
             return;
         };
+        dbg(app, "eventLoop: iter={d} woke: wl_fd={} timer_fd={}", .{ iteration, fds[0].revents & posix.POLL.IN != 0, fds[1].revents & posix.POLL.IN != 0 });
 
         if (fds[0].revents & posix.POLL.IN != 0) {
             _ = c.wl_display_read_events(app.display);
@@ -442,8 +649,15 @@ fn eventLoop(app: *App) !void {
 
         if (fds[1].revents & posix.POLL.IN != 0) {
             var expirations: u64 = 0;
-            _ = posix.read(app.timer_fd, std.mem.asBytes(&expirations)) catch {};
-            processKeycode(app, app.repeat_keycode) catch {};
+            // A disarm racing this read (see the NONBLOCK comment above)
+            // can mean there's nothing left to read even though poll()
+            // said so a moment ago; that's expected, not an error, and
+            // must not trigger a phantom repeat of a key that was just
+            // released.
+            const n = posix.read(app.timer_fd, std.mem.asBytes(&expirations)) catch 0;
+            if (n > 0 and expirations > 0) {
+                processKeycode(app, app.repeat_keycode) catch {};
+            }
         }
     }
 }
@@ -459,24 +673,37 @@ fn armRepeat(app: *App, keycode: u32) void {
         .it_value = .{ .sec = @divTrunc(delay_ns, 1_000_000_000), .nsec = @mod(delay_ns, 1_000_000_000) },
     };
     _ = linux.timerfd_settime(app.timer_fd, .{}, &spec, null);
+    dbg(app, "armRepeat: keycode={d} rate={d} delay={d}ms", .{ keycode, app.repeat_rate, app.repeat_delay });
 }
 
 fn disarmRepeat(app: *App) void {
     const zero: linux.itimerspec = .{ .it_interval = .{ .sec = 0, .nsec = 0 }, .it_value = .{ .sec = 0, .nsec = 0 } };
     _ = linux.timerfd_settime(app.timer_fd, .{}, &zero, null);
+    dbg(app, "disarmRepeat", .{});
 }
 
 fn processKeycode(app: *App, wayland_keycode: u32) !void {
-    const st = app.xkb_state orelse return;
+    const st = app.xkb_state orelse {
+        dbg(app, "processKeycode: no xkb_state yet, dropping key {d}", .{wayland_keycode});
+        return;
+    };
     const xkb_keycode = wayland_keycode + 8;
     const sym = c.xkb_state_key_get_one_sym(st, xkb_keycode);
 
     const ctrl_active = c.xkb_state_mod_name_is_active(st, c.XKB_MOD_NAME_CTRL, c.XKB_STATE_MODS_EFFECTIVE) == 1;
 
+    if (sym == c.XKB_KEY_Tab and app.mode != null) {
+        const shift_active = c.xkb_state_mod_name_is_active(st, c.XKB_MOD_NAME_SHIFT, c.XKB_STATE_MODS_EFFECTIVE) == 1;
+        try cycleMode(app, shift_active);
+        return;
+    }
+
     const event: ?core.state.KeyEvent = switch (sym) {
         c.XKB_KEY_Escape => .{ .named = .escape },
         c.XKB_KEY_Return, c.XKB_KEY_KP_Enter => .{ .named = .enter },
         c.XKB_KEY_BackSpace => .{ .named = .backspace },
+        c.XKB_KEY_Left => .{ .named = .left },
+        c.XKB_KEY_Right => .{ .named = .right },
         c.XKB_KEY_Up => .{ .named = .up },
         c.XKB_KEY_Down => .{ .named = .down },
         c.XKB_KEY_Prior => .{ .named = .page_up },
@@ -499,14 +726,211 @@ fn processKeycode(app: *App, wayland_keycode: u32) !void {
         break :blk core.state.KeyEvent{ .text = try app.allocator.dupe(u8, buf[0..@intCast(n)]) };
     } orelse return;
 
+    dbg(app, "processKeycode: sym=0x{x} ctrl={} event_kind={t}", .{ sym, ctrl_active, std.meta.activeTag(resolved) });
+
     const action = try app.state.handleKey(resolved);
+    dbg(app, "processKeycode: action={t} query_len={d} results={d} selected={d}", .{
+        action,
+        app.state.query.items.len,
+        app.state.results.items.len,
+        app.state.selected,
+    });
     switch (action) {
         .nothing => {},
         .redraw => app.need_redraw = true,
         .accept => {
-            app.accepted = app.state.selectedEntry();
-            app.running = false;
+            if (app.mode == .windows) {
+                // Windows mode focuses a live window instead of launching
+                // something; that has to happen here, now, while the
+                // Wayland connection is still open, not by handing an
+                // "action" string back to main.zig to shell out. Still set
+                // `accepted` (main.zig knows to skip launch() for this
+                // mode) so a successful activation doesn't get treated
+                // like a cancel -- both currently leave it null otherwise.
+                dbg(app, "accept(windows): results={d} selected={d} window_handles={d} seat={}", .{
+                    app.state.results.items.len,
+                    app.state.selected,
+                    app.window_handles.len,
+                    app.seat != null,
+                });
+                if (app.state.results.items.len > 0) {
+                    const idx = app.state.results.items[app.state.selected].index;
+                    dbg(app, "accept(windows): idx={d}", .{idx});
+                    if (idx < app.window_handles.len) {
+                        if (app.seat) |seat| {
+                            dbg(app, "accept(windows): activating handle", .{});
+                            c.zwlr_foreign_toplevel_handle_v1_activate(app.window_handles[idx], seat);
+                        }
+                    }
+                    // zwlr_foreign_toplevel_handle_v1.activate is a no-op
+                    // on Hyprland (verified: correct handle, correct seat,
+                    // matching protocol version, request flushed -- still
+                    // doesn't focus anything), a known-ish gap in the
+                    // wlroots-ecosystem's activate support. hyprctl is
+                    // authoritative there, so use it directly when present.
+                    if (app.state.selectedEntry()) |entry| {
+                        focusViaHyprctl(app, entry.label, entry.subtitle orelse "");
+                    }
+                }
+                app.accepted = app.state.selectedEntry();
+                app.running = false;
+            } else {
+                app.accepted = app.state.selectedEntry();
+                app.running = false;
+            }
         },
         .cancel => app.running = false,
     }
+}
+
+/// Rescans entries for the next (or previous) mode and rebuilds `app.state`
+/// with them, preserving the typed query. `app.mode`/`environ` being
+/// non-null is the caller's contract that this is reachable (dmenu, with
+/// its single fixed entry list, never wires Tab to this).
+/// Best-effort: shells out to `hyprctl` to focus the window matching
+/// `title`/`app_id` by its unique compositor address, when running under
+/// Hyprland (detected via `HYPRLAND_INSTANCE_SIGNATURE`). No-op anywhere
+/// else, and swallows all its own failures -- this is a fallback for a
+/// protocol gap, not something that should ever crash the picker.
+fn focusViaHyprctl(app: *App, title: []const u8, app_id: []const u8) void {
+    const environ = app.environ orelse return;
+    if (environ.get("HYPRLAND_INSTANCE_SIGNATURE") == null) return;
+
+    const clients_result = std.process.run(app.allocator, app.io, .{
+        .argv = &.{ "hyprctl", "-j", "clients" },
+    }) catch |err| {
+        dbg(app, "focusViaHyprctl: hyprctl clients failed: {t}", .{err});
+        return;
+    };
+    if (clients_result.term != .exited or clients_result.term.exited != 0) {
+        dbg(app, "focusViaHyprctl: hyprctl clients exited non-zero", .{});
+        return;
+    }
+
+    const parsed = std.json.parseFromSlice(std.json.Value, app.allocator, clients_result.stdout, .{}) catch |err| {
+        dbg(app, "focusViaHyprctl: bad JSON from hyprctl: {t}", .{err});
+        return;
+    };
+    defer parsed.deinit();
+    const clients = switch (parsed.value) {
+        .array => |a| a.items,
+        else => return,
+    };
+
+    // Prefer an exact title+class match; a shared class (e.g. two Firefox
+    // windows) is common enough that class alone would be ambiguous.
+    var address: ?[]const u8 = null;
+    for (clients) |item| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        const t = obj.get("title") orelse continue;
+        const cl = obj.get("class") orelse continue;
+        if (t != .string or cl != .string) continue;
+        if (std.mem.eql(u8, t.string, title) and std.mem.eql(u8, cl.string, app_id)) {
+            address = (obj.get("address") orelse continue).string;
+            break;
+        }
+    }
+    if (address == null) {
+        for (clients) |item| {
+            const obj = switch (item) {
+                .object => |o| o,
+                else => continue,
+            };
+            const cl = obj.get("class") orelse continue;
+            if (cl != .string or !std.mem.eql(u8, cl.string, app_id)) continue;
+            address = (obj.get("address") orelse continue).string;
+            break;
+        }
+    }
+    const addr = address orelse {
+        dbg(app, "focusViaHyprctl: no client matched title={s} class={s}", .{ title, app_id });
+        return;
+    };
+
+    const target = std.fmt.allocPrint(app.allocator, "address:{s}", .{addr}) catch return;
+    const dispatch_result = std.process.run(app.allocator, app.io, .{
+        .argv = &.{ "hyprctl", "dispatch", "focuswindow", target },
+    }) catch |err| {
+        dbg(app, "focusViaHyprctl: dispatch failed: {t}", .{err});
+        return;
+    };
+    dbg(app, "focusViaHyprctl: focused {s} (term={t})", .{ addr, dispatch_result.term });
+}
+
+fn cycleMode(app: *App, backward: bool) !void {
+    const current = app.mode.?;
+    const next_mode = if (backward) current.prev() else current.next();
+    const environ = app.environ.?;
+
+    app.window_handles = &.{};
+    const entries: []const core.state.Entry = switch (next_mode) {
+        .drun => core.sources.desktop.scan(app.allocator, app.io, environ, app.terminal_cmd) catch |err| {
+            dbg(app, "cycleMode: drun scan failed: {t}", .{err});
+            return;
+        },
+        .run => core.sources.path.scan(app.allocator, app.io, environ) catch |err| {
+            dbg(app, "cycleMode: run scan failed: {t}", .{err});
+            return;
+        },
+        .windows => try buildWindowEntries(app),
+    };
+
+    const query = try app.allocator.dupe(u8, app.state.query.items);
+    app.state.deinit();
+    app.state = try core.state.State.init(app.allocator, entries);
+    try app.state.setQuery(query);
+    app.state.visible_rows = app.theme.visibleRows();
+
+    app.mode = next_mode;
+    app.theme.compact_rows = next_mode == .run;
+    app.theme.active_tab = switch (next_mode) {
+        .drun => .apps,
+        .run => .run,
+        .windows => .windows,
+    };
+    app.theme.placeholder = switch (next_mode) {
+        .drun => "Search apps",
+        .run => "Search commands",
+        .windows => "Search windows",
+    };
+
+    app.need_redraw = true;
+    dbg(app, "cycleMode: switched to {t}, {d} entries", .{ next_mode, entries.len });
+}
+
+/// Snapshots the live `app.toplevels` list into entries, filling
+/// `app.window_handles` in the same order so `.accept` can look up which
+/// handle to activate. Closed toplevels are dropped (and freed) here
+/// rather than immediately on the `closed` event, since that event can
+/// arrive while this isn't the active mode.
+fn buildWindowEntries(app: *App) ![]core.state.Entry {
+    var entries: std.ArrayList(core.state.Entry) = .empty;
+    var handles: std.ArrayList(*c.zwlr_foreign_toplevel_handle_v1) = .empty;
+
+    var write: usize = 0;
+    for (app.toplevels.items) |t| {
+        if (t.closed) {
+            app.allocator.free(t.title);
+            app.allocator.free(t.app_id);
+            app.allocator.destroy(t);
+            continue;
+        }
+        app.toplevels.items[write] = t;
+        write += 1;
+
+        const title = if (t.title.len > 0) t.title else "(untitled)";
+        try entries.append(app.allocator, .{
+            .label = title,
+            .subtitle = t.app_id,
+            .icon_name = if (t.app_id.len > 0) t.app_id else null,
+        });
+        try handles.append(app.allocator, t.handle);
+    }
+    app.toplevels.shrinkRetainingCapacity(write);
+
+    app.window_handles = try handles.toOwnedSlice(app.allocator);
+    return entries.toOwnedSlice(app.allocator);
 }

@@ -36,6 +36,10 @@
             .url = "https://github.com/vancluever/z2d/archive/refs/tags/v0.12.1.tar.gz",
             .hash = "z2d-0.12.1-j5P_Hsw8EQAKyZTQICCQnAH2xYkLDW8k9uefbsYdfPZ-",
         },
+        .zigimg = .{
+            .url = "https://github.com/zigimg/zigimg/archive/refs/tags/zigimg_zig_0.16.0.tar.gz",
+            .hash = "zigimg-0.1.0-8_eo2oyaFwBZwJpmqPkCfVXWBrHcqbYwmrp1I6bTD3lI",
+        },
     },
     .paths = .{
         "build.zig",

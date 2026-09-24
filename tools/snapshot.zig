@@ -16,17 +16,17 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     const entries = [_]state_mod.Entry{
-        .{ .label = "firefox" },
-        .{ .label = "file-manager" },
-        .{ .label = "fire-extinguisher-simulator" },
-        .{ .label = "vim" },
-        .{ .label = "visual-studio-code" },
-        .{ .label = "terminal" },
-        .{ .label = "gimp" },
-        .{ .label = "inkscape" },
-        .{ .label = "blender" },
-        .{ .label = "a-very-long-application-name-that-should-truncate-nicely" },
-        .{ .label = "spotify" },
+        .{ .label = "firefox", .subtitle = "Web Browser", .action = "/usr/bin/firefox" },
+        .{ .label = "file-manager", .subtitle = "File Manager", .action = "/usr/bin/file-manager" },
+        .{ .label = "fire-extinguisher-simulator", .subtitle = "Game" },
+        .{ .label = "vim", .subtitle = "Text Editor" },
+        .{ .label = "visual-studio-code", .subtitle = "Code Editor" },
+        .{ .label = "terminal", .subtitle = "Terminal Emulator" },
+        .{ .label = "gimp", .subtitle = "Image Editor" },
+        .{ .label = "inkscape", .subtitle = "Vector Graphics" },
+        .{ .label = "blender", .subtitle = "3D Creation Suite" },
+        .{ .label = "a-very-long-application-name-that-should-truncate-nicely", .subtitle = "Truncation Test" },
+        .{ .label = "spotify", .subtitle = "Music Streaming" },
     };
 
     var state = try state_mod.State.init(arena, &entries);
@@ -34,17 +34,21 @@ pub fn main(init: std.process.Init) !void {
     _ = try state.handleKey(.{ .named = .down });
 
     var theme = theme_mod.Theme{};
-    theme.font_path = (try font_mod.find(arena, io, &.{ "DejaVuSans", "Inter", "Noto", "Liberation" })) orelse
+    theme.show_tabs = true;
+    theme.active_tab = .apps;
+    theme.font_path = (try font_mod.fcMatch(arena, io, "monospace")) orelse
+        (try font_mod.find(arena, io, &.{ "DejaVuSansMono", "Mono", "Consolas", "Menlo" })) orelse
+        (try font_mod.find(arena, io, &.{ "DejaVuSans", "Inter", "Noto", "Liberation" })) orelse
         (try font_mod.fcMatch(arena, io, "sans-serif")) orelse
         (try font_mod.findAny(arena, io));
-    state.visible_rows = theme.visible_rows;
+    state.visible_rows = theme.visibleRows();
 
     for ([_]f64{ 1, 2 }) |scale| {
         const w: i32 = @intFromFloat(theme.panel_width * scale);
-        const h: i32 = @intFromFloat(theme.panelHeight() * scale);
+        const h: i32 = @intFromFloat(theme.panel_height * scale);
         var surface = try z2d.Surface.init(.image_surface_rgba, arena, w, h);
 
-        try render_mod.render(io, arena, &surface, &theme, &state, scale);
+        try render_mod.render(io, arena, &surface, &theme, &state, scale, null);
 
         var buf: [64]u8 = undefined;
         const filename = try std.fmt.bufPrint(&buf, "zofi-snapshot@{d}x.png", .{@as(u32, @intFromFloat(scale))});

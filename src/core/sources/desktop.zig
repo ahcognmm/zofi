@@ -7,6 +7,9 @@ const Entry = @import("../state.zig").Entry;
 const ParsedEntry = struct {
     name: ?[]const u8 = null,
     exec: ?[]const u8 = null,
+    generic_name: ?[]const u8 = null,
+    comment: ?[]const u8 = null,
+    icon: ?[]const u8 = null,
     terminal: bool = false,
     no_display: bool = false,
     hidden: bool = false,
@@ -36,6 +39,12 @@ fn parse(contents: []const u8) ParsedEntry {
             result.name = value;
         } else if (std.mem.eql(u8, key, "Exec")) {
             result.exec = value;
+        } else if (std.mem.eql(u8, key, "GenericName")) {
+            result.generic_name = value;
+        } else if (std.mem.eql(u8, key, "Comment")) {
+            result.comment = value;
+        } else if (std.mem.eql(u8, key, "Icon")) {
+            result.icon = value;
         } else if (std.mem.eql(u8, key, "Terminal")) {
             result.terminal = std.mem.eql(u8, value, "true");
         } else if (std.mem.eql(u8, key, "NoDisplay")) {
@@ -132,7 +141,12 @@ pub fn scan(
         defer walker.deinit();
 
         while (try walker.next(io)) |walk_entry| {
-            if (walk_entry.kind != .file) continue;
+            // NixOS (and other profile-based distros) populate
+            // applications/ entirely with symlinks into the store; readdir
+            // reports those as .sym_link, not .file, without following
+            // them. Rejecting anything but .file here silently dropped
+            // every real desktop entry on such systems.
+            if (walk_entry.kind != .file and walk_entry.kind != .sym_link) continue;
             if (!std.mem.endsWith(u8, walk_entry.basename, ".desktop")) continue;
 
             if (seen_ids.contains(walk_entry.path)) continue;
@@ -152,7 +166,12 @@ pub fn scan(
             else
                 stripped;
 
-            try entries.append(allocator, .{ .label = name, .action = final_exec });
+            try entries.append(allocator, .{
+                .label = name,
+                .action = final_exec,
+                .subtitle = parsed.generic_name orelse parsed.comment,
+                .icon_name = parsed.icon,
+            });
         }
     }
 
