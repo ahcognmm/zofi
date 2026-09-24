@@ -7,6 +7,7 @@ pub const render = @import("render.zig");
 pub const font = @import("font.zig");
 pub const icon = @import("icon.zig");
 pub const launch = @import("launch.zig");
+pub const singleton = @import("singleton.zig");
 
 pub const sources = struct {
     pub const stdin = @import("sources/stdin.zig");

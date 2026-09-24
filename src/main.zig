@@ -62,6 +62,15 @@ pub fn main(init: std.process.Init) !void {
 
     const debug = environ.get("ZOFI_DEBUG") != null;
 
+    // Only the windowed modes open a layer-shell surface; the headless
+    // rank harness below has nothing to conflict with.
+    if (dmenu or show != null) {
+        if (!core.singleton.acquire(environ)) {
+            if (debug) std.debug.print("zofi: another instance is already running, exiting\n", .{});
+            return;
+        }
+    }
+
     if (dmenu) {
         var stdin_buffer: [64 * 1024]u8 = undefined;
         var stdin_reader = Io.File.Reader.init(.stdin(), io, &stdin_buffer);
