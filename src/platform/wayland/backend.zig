@@ -466,6 +466,7 @@ pub fn run(
     // same page size, or the highlighted row and what's actually painted
     // can disagree once a config lets these diverge.
     app.state.visible_rows = app.theme.visibleRows();
+    app.state.browser = app.theme.browser_cmd;
 
     _ = c.wl_registry_add_listener(registry, &registry_listener, &app);
     if (c.wl_display_roundtrip(display) == -1) return error.RoundtripFailed;
@@ -480,6 +481,7 @@ pub fn run(
         app.state.deinit();
         app.state = try core.state.State.init(allocator, window_entries);
         app.state.visible_rows = app.theme.visibleRows();
+        app.state.browser = app.theme.browser_cmd;
     }
 
     const compositor = app.compositor orelse return error.NoCompositor;
@@ -772,10 +774,16 @@ fn processKeycode(app: *App, wayland_keycode: u32) !void {
                         focusViaHyprctl(app, entry.label, entry.subtitle orelse "");
                     }
                 }
-                app.accepted = app.state.selectedEntry();
+                app.accepted = if (app.state.selectedEntry()) |e|
+                    try core.state.State.dupeEntry(e, app.allocator)
+                else
+                    null;
                 app.running = false;
             } else {
-                app.accepted = app.state.selectedEntry();
+                app.accepted = if (app.state.selectedEntry()) |e|
+                    try core.state.State.dupeEntry(e, app.allocator)
+                else
+                    null;
                 app.running = false;
             }
         },
@@ -883,6 +891,7 @@ fn cycleMode(app: *App, backward: bool) !void {
     app.state = try core.state.State.init(app.allocator, entries);
     try app.state.setQuery(query);
     app.state.visible_rows = app.theme.visibleRows();
+    app.state.browser = app.theme.browser_cmd;
 
     app.mode = next_mode;
     app.theme.compact_rows = next_mode == .run;

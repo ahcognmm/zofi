@@ -144,6 +144,7 @@ fn runLauncher(
 ) !void {
     var theme = try defaultTheme(arena, io);
     theme.show_tabs = true;
+    theme.browser_cmd = environ.get("ZOFI_BROWSER") orelse "firefox";
     switch (mode) {
         .drun => {
             theme.compact_rows = false;
@@ -175,6 +176,10 @@ fn runLauncher(
     // shell out to here, and entry.action isn't even a command.
     if (mode == .windows) return;
 
+    if (entry.is_url) {
+        try core.launch.launchUrl(arena, io, environ, theme.browser_cmd, entry.action orelse entry.label);
+        return;
+    }
     try core.launch.launch(arena, io, environ, entry.action orelse entry.label);
 }
 
@@ -191,7 +196,7 @@ fn runRankHarness(arena: std.mem.Allocator, io: Io, entries: []const core.state.
 
     const n = @min(state.results.items.len, 10);
     for (state.results.items[0..n]) |r| {
-        try w.print("{s}\n", .{entries[r.index].label});
+        try w.print("{s}\n", .{state.entryAt(r.index).label});
     }
     try w.flush();
 }

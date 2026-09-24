@@ -37,6 +37,10 @@ pub const Theme = struct {
     /// the prompt's accent color. `show_tabs` should be false whenever
     /// this is set.
     dmenu_prompt: ?[]const u8 = null,
+    /// Binary name used to open a URL-shaped query (see `state.zig`'s
+    /// synthetic "open in browser" entry). Also used as the freedesktop
+    /// icon name for that row's tile. Override with `$ZOFI_BROWSER`.
+    browser_cmd: []const u8 = "firefox",
 
     // Panel
     panel_width: f64 = 640,

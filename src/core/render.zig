@@ -215,7 +215,7 @@ fn drawRows(ctx: *z2d.Context, surface: *z2d.Surface, theme: *const Theme, state
     for (0..visible) |row_i| {
         const result_i = state.scroll + row_i;
         const result = state.results.items[result_i];
-        const entry = state.entries[result.index];
+        const entry = state.entryAt(result.index);
         const row_y = rows_top + @as(f64, @floatFromInt(row_i)) * (row_h + row_gap);
         const selected = result_i == state.selected;
 

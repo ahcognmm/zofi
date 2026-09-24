@@ -15,6 +15,10 @@ pub const Entry = struct {
     /// decoded lazily by `core.icon.Cache`. Falls back to the colored
     /// letter tile when null or unresolvable.
     icon_name: ?[]const u8 = null,
+    /// True only for the synthetic "open in browser" row `entryAt` makes up
+    /// for a URL-shaped query. Callers use it to decide whether `action` is
+    /// a URL to hand to a browser rather than a command to run as-is.
+    is_url: bool = false,
 };
 
 pub const Result = struct {
@@ -60,6 +64,16 @@ pub const State = struct {
     scroll: usize = 0,
     visible_rows: usize = 10,
     scratch: fuzzy.Scratch,
+    /// Scratch storage for the synthetic "open in browser" entry's `action`
+    /// (the normalized URL). Reused across keystrokes; `Result.index ==
+    /// entries.len` is the sentinel that says "read from here, not from
+    /// `entries`" (see `entryAt`).
+    url_action: std.ArrayList(u8) = .empty,
+    has_url_entry: bool = false,
+    /// Binary name for the synthetic entry's icon and what `main.zig` shells
+    /// out to on accept. Platform-independent in spirit -- it's just a
+    /// string the caller (theme config) hands in, not a platform API call.
+    browser: []const u8 = "firefox",
 
     pub fn init(allocator: std.mem.Allocator, entries: []const Entry) !State {
         var self: State = .{
@@ -74,8 +88,40 @@ pub const State = struct {
     pub fn deinit(self: *State) void {
         self.query.deinit(self.allocator);
         self.results.deinit(self.allocator);
+        self.url_action.deinit(self.allocator);
         self.scratch.deinit();
         self.* = undefined;
+    }
+
+    /// `entryAt`'s synthetic "open in browser" entry aliases `query`/
+    /// `url_action`, both freed by `deinit`. Callers that need the entry to
+    /// outlive this `State` (e.g. an accepted result returned to the
+    /// caller) must copy it out via this first -- `Allocator.free`
+    /// unconditionally poisons freed bytes in safety-checked builds, so
+    /// holding onto the alias past `deinit` reads garbage.
+    pub fn dupeEntry(entry: Entry, allocator: std.mem.Allocator) !Entry {
+        if (!entry.is_url) return entry; // already durable: owned by the caller-supplied entries slice
+        var out = entry;
+        out.label = try allocator.dupe(u8, entry.label);
+        if (entry.action) |a| out.action = try allocator.dupe(u8, a);
+        return out;
+    }
+
+    /// Resolves a `Result.index` to its `Entry`, transparently covering the
+    /// synthetic "open in browser" row (sentinel index == entries.len)
+    /// alongside real entries. Callers (rendering, accept) should go
+    /// through this instead of indexing `entries` directly.
+    pub fn entryAt(self: *const State, index: usize) Entry {
+        if (index == self.entries.len) {
+            return .{
+                .label = self.query.items,
+                .subtitle = "Open in browser",
+                .action = self.url_action.items,
+                .icon_name = self.browser,
+                .is_url = true,
+            };
+        }
+        return self.entries[index];
     }
 
     pub fn setQuery(self: *State, text: []const u8) !void {
@@ -87,7 +133,7 @@ pub const State = struct {
 
     pub fn selectedEntry(self: *const State) ?Entry {
         if (self.results.items.len == 0) return null;
-        return self.entries[self.results.items[self.selected].index];
+        return self.entryAt(self.results.items[self.selected].index);
     }
 
     pub fn handleKey(self: *State, ev: KeyEvent) !Action {
@@ -183,6 +229,7 @@ pub const State = struct {
         const q = self.query.items;
 
         if (q.len == 0) {
+            self.has_url_entry = false;
             try self.results.ensureTotalCapacity(self.allocator, self.entries.len);
             for (self.entries, 0..) |_, i| {
                 self.results.appendAssumeCapacity(.{ .index = i, .score = fuzzy.SCORE_MAX });
@@ -195,6 +242,12 @@ pub const State = struct {
                 }
             }
             std.mem.sort(Result, self.results.items, self.entries, lessThan);
+
+            self.has_url_entry = looksLikeUrl(q);
+            if (self.has_url_entry) {
+                try normalizeUrl(&self.url_action, self.allocator, q);
+                try self.results.insert(self.allocator, 0, .{ .index = self.entries.len, .score = fuzzy.SCORE_MAX });
+            }
         }
 
         self.selected = 0;
@@ -235,6 +288,47 @@ pub const State = struct {
         self.cursor = start;
     }
 };
+
+/// Heuristic, not a full URL grammar: accepts `http(s)://...` verbatim, or a
+/// bare `host[:port][/path]` with no spaces, a dotted hostname and an
+/// alphabetic TLD of 2+ chars -- enough to catch "google.com" or
+/// "localhost:8080/foo" typed as a query without misfiring on ordinary app
+/// names (which rarely contain a dot followed by 2+ letters).
+fn looksLikeUrl(q: []const u8) bool {
+    if (q.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, q, ' ') != null) return false;
+    if (std.mem.startsWith(u8, q, "http://") or std.mem.startsWith(u8, q, "https://")) return true;
+
+    const host_end = std.mem.indexOfAny(u8, q, "/?#") orelse q.len;
+    var host = q[0..host_end];
+    if (host.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, host, ':')) |ci| host = host[0..ci];
+    if (host.len == 0) return false;
+
+    const last_dot = std.mem.lastIndexOfScalar(u8, host, '.') orelse return false;
+    if (last_dot == 0 or last_dot == host.len - 1) return false;
+
+    for (host) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '.')) return false;
+    }
+
+    const tld = host[last_dot + 1 ..];
+    if (tld.len < 2) return false;
+    for (tld) |c| {
+        if (!std.ascii.isAlphabetic(c)) return false;
+    }
+    return true;
+}
+
+fn normalizeUrl(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, q: []const u8) !void {
+    buf.clearRetainingCapacity();
+    if (std.mem.startsWith(u8, q, "http://") or std.mem.startsWith(u8, q, "https://")) {
+        try buf.appendSlice(allocator, q);
+    } else {
+        try buf.appendSlice(allocator, "https://");
+        try buf.appendSlice(allocator, q);
+    }
+}
 
 fn prevUtf8Boundary(bytes: []const u8) usize {
     if (bytes.len == 0) return 0;
@@ -361,6 +455,42 @@ test "enter and escape report accept/cancel" {
     defer s.deinit();
     try std.testing.expectEqual(Action.accept, try s.handleKey(.{ .named = .enter }));
     try std.testing.expectEqual(Action.cancel, try s.handleKey(.{ .named = .escape }));
+}
+
+test "a URL-shaped query surfaces a synthetic 'open in browser' entry on top" {
+    var s = try State.init(std.testing.allocator, testEntries());
+    defer s.deinit();
+    try s.setQuery("google.com");
+    try std.testing.expect(s.has_url_entry);
+    const top = s.selectedEntry().?;
+    try std.testing.expect(top.is_url);
+    try std.testing.expectEqualStrings("https://google.com", top.action.?);
+}
+
+test "an explicit scheme is kept as-is" {
+    var s = try State.init(std.testing.allocator, testEntries());
+    defer s.deinit();
+    try s.setQuery("http://example.com/path?q=1");
+    const top = s.selectedEntry().?;
+    try std.testing.expect(top.is_url);
+    try std.testing.expectEqualStrings("http://example.com/path?q=1", top.action.?);
+}
+
+test "plain app names don't trigger the URL entry" {
+    var s = try State.init(std.testing.allocator, testEntries());
+    defer s.deinit();
+    try s.setQuery("firefox");
+    try std.testing.expect(!s.has_url_entry);
+    try std.testing.expectEqualStrings("firefox", s.selectedEntry().?.label);
+}
+
+test "queries with spaces or no valid TLD don't trigger the URL entry" {
+    var s = try State.init(std.testing.allocator, testEntries());
+    defer s.deinit();
+    try s.setQuery("open file.txt please");
+    try std.testing.expect(!s.has_url_entry);
+    try s.setQuery("file.t");
+    try std.testing.expect(!s.has_url_entry);
 }
 
 test "escape clears a non-empty query before it cancels" {
