@@ -132,7 +132,7 @@ pub const Theme = struct {
     dash_cal_row_h: f64 = 30,
     dash_cal_col_gap: f64 = 2,
 
-    dash_recent_gap: f64 = 6, // between "RECENT" label and the tile row
+    dash_recent_gap: f64 = 18, // between "RECENT" label and the tile row
     dash_recent_label_font_size: f64 = 11.5,
     dash_recent_label_pad_x: f64 = 8,
     dash_recent_name_font_size: f64 = 13.5,

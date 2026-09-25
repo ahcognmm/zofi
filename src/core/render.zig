@@ -12,6 +12,7 @@ const icon_mod = @import("icon.zig");
 const dashboard_mod = @import("dashboard.zig");
 const history_mod = @import("history.zig");
 const weather_mod = @import("weather.zig");
+const L = @import("ui/layout.zig");
 
 pub const Size = struct { width: f64, height: f64 };
 
@@ -266,25 +267,29 @@ fn drawDashboard(
 ) !void {
     const dash = dashboard_mod.build(alloc) catch return;
 
-    const gap = theme.dash_gap * scale;
-    const inner_top = content_top + theme.dash_pad_top * scale;
-    const inner_bottom = content_bottom - theme.dash_pad_bottom * scale;
+    // Mirrors `zofi-home.html`'s `.home > .top(.left, .calendar), .recent`
+    // box model directly: `left`/`recent` are `flex: 1` in CSS, `calendar`
+    // is a fixed width, `.top` is a fixed height.
+    var left: L.Node = .{ .width = .{ .flex = 1 } };
+    var calendar: L.Node = .{ .width = .{ .fixed = theme.dash_calendar_width * scale } };
+    var top: L.Node = .{
+        .axis = .row,
+        .gap = theme.dash_col_gap * scale,
+        .height = .{ .fixed = theme.dash_top_h * scale },
+        .children = &.{ &left, &calendar },
+    };
+    var recent: L.Node = .{ .height = .{ .flex = 1 } };
+    var home: L.Node = .{
+        .axis = .column,
+        .gap = theme.dash_gap * scale,
+        .padding = .{ .top = theme.dash_pad_top * scale, .bottom = theme.dash_pad_bottom * scale },
+        .children = &.{ &top, &recent },
+    };
+    L.layout(&home, .{ .x = padding, .y = content_top, .w = width - padding * 2, .h = content_bottom - content_top });
 
-    const content_x = padding;
-    const content_w = width - padding * 2;
-
-    const top_h = theme.dash_top_h * scale;
-    const recent_y = inner_top + top_h + gap;
-    const recent_h = inner_bottom - recent_y;
-
-    const col_gap = theme.dash_col_gap * scale;
-    const cal_w = theme.dash_calendar_width * scale;
-    const left_w = content_w - col_gap - cal_w;
-    const right_x = content_x + left_w + col_gap;
-
-    try drawClockAndWeather(ctx, theme, io, alloc, environ, dash, content_x, inner_top, left_w, top_h, scale);
-    try drawCalendarCard(ctx, theme, dash, right_x, inner_top, cal_w, top_h, scale);
-    try drawRecentSection(ctx, surface, theme, io, alloc, environ, icon_cache, content_x, recent_y, content_w, recent_h, scale);
+    try drawClockAndWeather(ctx, theme, io, alloc, environ, dash, left.result, scale);
+    try drawCalendarCard(ctx, theme, dash, calendar.result, scale);
+    try drawRecentSection(ctx, surface, theme, io, alloc, environ, icon_cache, recent.result, scale);
 }
 
 /// Clips `text` to whatever whole number of characters fits in `avail_w`
@@ -312,50 +317,59 @@ fn drawClockAndWeather(
     alloc: std.mem.Allocator,
     environ: ?*const std.process.Environ.Map,
     dash: dashboard_mod.Dashboard,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
+    outer: L.Rect,
     scale: f64,
 ) !void {
+    // `.clock`'s own box (padding 8/8/0/8) sized to exactly fit its two
+    // fixed-size text lines; `.left`'s `gap: 14` then leads into the card,
+    // which takes whatever's left (`flex: 1` in the original CSS).
     const clock_pad = theme.dash_clock_pad * scale;
-    const clock_x = x + clock_pad;
     const clock_fs = theme.dash_clock_font_size * scale;
+    const date_fs = theme.dash_date_font_size * scale;
+    const clock_h = clock_pad + clock_fs + theme.dash_clock_gap * scale + date_fs;
+
+    var clock_line: L.Node = .{ .height = .{ .fixed = clock_fs } };
+    var date_line: L.Node = .{ .height = .{ .fixed = date_fs } };
+    var clock_block: L.Node = .{
+        .axis = .column,
+        .gap = theme.dash_clock_gap * scale,
+        .padding = .{ .top = clock_pad, .left = clock_pad, .right = clock_pad },
+        .height = .{ .fixed = clock_h },
+        .children = &.{ &clock_line, &date_line },
+    };
+    var weather_card: L.Node = .{ .height = .{ .flex = 1 } };
+    var left: L.Node = .{
+        .axis = .column,
+        .gap = theme.dash_left_gap * scale,
+        .children = &.{ &clock_block, &weather_card },
+    };
+    L.layout(&left, outer);
+
     ctx.setFontSize(clock_fs);
     ctx.setSourceToPixel(theme.text);
     var clock_buf: [8]u8 = undefined;
     const clock_str = std.fmt.bufPrint(&clock_buf, "{d:0>2}:{d:0>2}", .{ dash.hour, dash.minute }) catch "";
-    try ctx.showText(clock_str, clock_x, y + clock_pad);
+    try ctx.showText(clock_str, clock_line.result.x, clock_line.result.y);
     ctx.resetPath();
 
-    const date_fs = theme.dash_date_font_size * scale;
     ctx.setFontSize(date_fs);
     ctx.setSourceToPixel(theme.dim);
-    const date_y = y + clock_pad + clock_fs + theme.dash_clock_gap * scale;
-    try ctx.showText(dash.weekday_date, clock_x, date_y);
+    try ctx.showText(dash.weekday_date, date_line.result.x, date_line.result.y);
     ctx.resetPath();
 
-    // .clock's own box (padding 8/8/0/8, i.e. no bottom padding) ends right
-    // after the date line; .left's `gap: 14` then leads into the card.
-    const card_y = date_y + date_fs + theme.dash_left_gap * scale;
-    const card_h = (y + h) - card_y;
-    if (card_h <= 0) return;
-
+    if (weather_card.result.h <= 0) return;
     const weather = if (environ) |e| weather_mod.loadCached(alloc, io, e) else null;
-    try drawWeatherCard(ctx, theme, weather, x, card_y, w, card_h, scale);
+    try drawWeatherCard(ctx, theme, weather, weather_card.result, scale);
 }
 
-fn drawWeatherCard(ctx: *z2d.Context, theme: *const Theme, weather: ?weather_mod.Weather, x: f64, y: f64, w: f64, h: f64, scale: f64) !void {
-    try drawCard(ctx, theme, x, y, w, h, scale);
-
-    const pad_top = theme.dash_weather_pad_top * scale;
+fn drawWeatherCard(ctx: *z2d.Context, theme: *const Theme, weather: ?weather_mod.Weather, outer: L.Rect, scale: f64) !void {
+    try drawCard(ctx, theme, outer.x, outer.y, outer.w, outer.h, scale);
     const pad_x = theme.dash_weather_pad_x * scale;
-    const pad_bottom = theme.dash_weather_pad_bottom * scale;
 
     const wx = weather orelse {
         ctx.setFontSize(theme.dash_cond_font_size * scale);
         ctx.setSourceToPixel(theme.faint);
-        try ctx.showText("Weather unavailable", x + pad_x, y + pad_top);
+        try ctx.showText("Weather unavailable", outer.x + pad_x, outer.y + theme.dash_weather_pad_top * scale);
         ctx.resetPath();
         return;
     };
@@ -367,70 +381,98 @@ fn drawWeatherCard(ctx: *z2d.Context, theme: *const Theme, weather: ?weather_mod
     const now_gap = theme.dash_weather_now_gap * scale;
     const cond_gap = theme.dash_cond_gap * scale;
 
+    var temp_buf: [16]u8 = undefined;
+    const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.0}\xC2\xB0", .{wx.temp_c}) catch ""; // "°"
+    const temp_w = @as(f64, @floatFromInt(temp_str.len)) * Theme.charWidth(temp_fs);
+
+    const time_fs = theme.dash_forecast_time_font_size * scale;
+    const val_fs = theme.dash_forecast_temp_font_size * scale;
+    const forecast_icon_size = theme.dash_forecast_icon_size * scale;
+    const slot_gap = theme.dash_forecast_slot_gap * scale;
+    const has_forecast = wx.hourly.len > 0;
+    const forecast_h = if (has_forecast) time_fs + slot_gap + forecast_icon_size + slot_gap + val_fs else 0;
+
     // "now" row (icon, temp, condition/location) pinned to the card's top;
     // the forecast row (below) is pinned to its bottom -- `justify-content:
     // space-between` in the original design -- with whatever's left as
     // plain empty card between them, not a broken-looking half-empty box.
-    const row_top = y + pad_top;
-    const row_h = @max(icon_size, cond_fs + cond_gap + loc_fs);
-    const row_cy = row_top + row_h / 2;
+    var icon_node: L.Node = .{ .width = .{ .fixed = icon_size }, .height = .{ .fixed = icon_size } };
+    var temp_node: L.Node = .{ .width = .{ .fixed = temp_w }, .height = .{ .fixed = temp_fs } };
+    var cond_line: L.Node = .{ .height = .{ .fixed = cond_fs } };
+    var loc_line: L.Node = .{ .height = .{ .fixed = loc_fs } };
+    var cond_block: L.Node = .{
+        .axis = .column,
+        .gap = cond_gap,
+        .width = .{ .flex = 1 },
+        .height = .{ .fixed = cond_fs + cond_gap + loc_fs },
+        .children = &.{ &cond_line, &loc_line },
+    };
+    var now_row: L.Node = .{
+        .axis = .row,
+        .gap = now_gap,
+        .align_items = .center,
+        .height = .{ .fixed = @max(icon_size, cond_fs + cond_gap + loc_fs) },
+        .children = &.{ &icon_node, &temp_node, &cond_block },
+    };
+    var forecast_row: L.Node = .{ .height = .{ .fixed = forecast_h } };
+    var card_content: L.Node = .{
+        .axis = .column,
+        .justify = .space_between,
+        .padding = .{ .top = theme.dash_weather_pad_top * scale, .left = pad_x, .right = pad_x, .bottom = theme.dash_weather_pad_bottom * scale },
+        .children = if (has_forecast) &.{ &now_row, &forecast_row } else &.{&now_row},
+    };
+    L.layout(&card_content, outer);
 
-    const icon_x = x + pad_x;
-    try drawWeatherIcon(ctx, theme, weather_mod.iconFor(wx.code), icon_x, row_cy - icon_size / 2, icon_size, scale);
+    try drawWeatherIcon(ctx, theme, weather_mod.iconFor(wx.code), icon_node.result.x, icon_node.result.y, icon_size, scale);
 
-    const temp_x = icon_x + icon_size + now_gap;
     ctx.setFontSize(temp_fs);
     ctx.setSourceToPixel(theme.text);
-    var temp_buf: [16]u8 = undefined;
-    const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.0}\xC2\xB0", .{wx.temp_c}) catch ""; // "°"
-    try ctx.showText(temp_str, temp_x, row_cy - temp_fs / 2);
+    try ctx.showText(temp_str, temp_node.result.x, temp_node.result.y);
     ctx.resetPath();
 
-    const cond_x = temp_x + @as(f64, @floatFromInt(temp_str.len)) * Theme.charWidth(temp_fs) + now_gap;
-    const cond_avail_w = (x + w - pad_x) - cond_x;
-    const cond_block_h = cond_fs + cond_gap + loc_fs;
-    const cond_y = row_cy - cond_block_h / 2;
     ctx.setFontSize(cond_fs);
     ctx.setSourceToPixel(theme.text);
-    try ctx.showText(truncateToWidth(wx.condition(), cond_avail_w, Theme.charWidth(cond_fs)), cond_x, cond_y);
+    try ctx.showText(truncateToWidth(wx.condition(), cond_line.result.w, Theme.charWidth(cond_fs)), cond_line.result.x, cond_line.result.y);
     ctx.resetPath();
 
     ctx.setFontSize(loc_fs);
     ctx.setSourceToPixel(theme.dim);
     var loc_buf: [96]u8 = undefined;
     const loc_str = std.fmt.bufPrint(&loc_buf, "{s} \xC2\xB7 H {d:.0}\xC2\xB0 L {d:.0}\xC2\xB0", .{ wx.city, wx.high_c, wx.low_c }) catch "";
-    try ctx.showText(truncateToWidth(loc_str, cond_avail_w, Theme.charWidth(loc_fs)), cond_x, cond_y + cond_fs + cond_gap);
+    try ctx.showText(truncateToWidth(loc_str, loc_line.result.w, Theme.charWidth(loc_fs)), loc_line.result.x, loc_line.result.y);
     ctx.resetPath();
 
-    if (wx.hourly.len == 0) return;
+    if (!has_forecast) return;
 
-    const time_fs = theme.dash_forecast_time_font_size * scale;
-    const val_fs = theme.dash_forecast_temp_font_size * scale;
-    const forecast_icon_size = theme.dash_forecast_icon_size * scale;
-    const slot_gap = theme.dash_forecast_slot_gap * scale;
-    const forecast_h = time_fs + slot_gap + forecast_icon_size + slot_gap + val_fs;
-
-    const rule_y = (y + h) - pad_bottom - forecast_h - theme.dash_forecast_gap_top * scale;
+    const rule_y = forecast_row.result.y - theme.dash_forecast_gap_top * scale;
     ctx.setSourceToPixel(theme.border);
-    try fillRect(ctx, x + pad_x, rule_y, w - pad_x * 2, @max(1.0, scale));
+    try fillRect(ctx, outer.x + pad_x, rule_y, outer.w - pad_x * 2, @max(1.0, scale));
     ctx.resetPath();
 
-    const forecast_top = rule_y + theme.dash_forecast_gap_top * scale;
-    const col_gap = theme.dash_forecast_col_gap * scale;
-    const slot_w = (w - pad_x * 2 - col_gap * @as(f64, @floatFromInt(wx.hourly.len - 1))) / @as(f64, @floatFromInt(wx.hourly.len));
-    var i: usize = 0;
-    while (i < wx.hourly.len) : (i += 1) {
-        const hf = wx.hourly[i];
-        const slot_x = x + pad_x + (slot_w + col_gap) * @as(f64, @floatFromInt(i));
-        const slot_cx = slot_x + slot_w / 2;
+    var slot_nodes: [4]L.Node = undefined;
+    var slot_ptrs: [4]*L.Node = undefined;
+    for (0..wx.hourly.len) |i| {
+        slot_nodes[i] = .{ .width = .{ .flex = 1 } };
+        slot_ptrs[i] = &slot_nodes[i];
+    }
+    var forecast_slots: L.Node = .{
+        .axis = .row,
+        .gap = theme.dash_forecast_col_gap * scale,
+        .children = slot_ptrs[0..wx.hourly.len],
+    };
+    L.layout(&forecast_slots, forecast_row.result);
+
+    for (wx.hourly, 0..) |hf, i| {
+        const slot = slot_nodes[i].result;
+        const slot_cx = slot.x + slot.w / 2;
 
         ctx.setFontSize(time_fs);
         ctx.setSourceToPixel(theme.faint);
         const time_w = @as(f64, @floatFromInt(hf.label.len)) * Theme.charWidth(time_fs);
-        try ctx.showText(hf.label, slot_cx - time_w / 2, forecast_top);
+        try ctx.showText(hf.label, slot_cx - time_w / 2, slot.y);
         ctx.resetPath();
 
-        const hi_y = forecast_top + time_fs + slot_gap;
+        const hi_y = slot.y + time_fs + slot_gap;
         try drawWeatherIcon(ctx, theme, weather_mod.iconFor(hf.code), slot_cx - forecast_icon_size / 2, hi_y, forecast_icon_size, scale);
 
         var htemp_buf: [16]u8 = undefined;
@@ -546,64 +588,92 @@ fn drawWeatherIcon(ctx: *z2d.Context, theme: *const Theme, icon: weather_mod.Ico
     }
 }
 
-fn drawCalendarCard(ctx: *z2d.Context, theme: *const Theme, dash: dashboard_mod.Dashboard, x: f64, y: f64, w: f64, h: f64, scale: f64) !void {
-    try drawCard(ctx, theme, x, y, w, h, scale);
+fn drawCalendarCard(ctx: *z2d.Context, theme: *const Theme, dash: dashboard_mod.Dashboard, outer: L.Rect, scale: f64) !void {
+    try drawCard(ctx, theme, outer.x, outer.y, outer.w, outer.h, scale);
 
-    const pad_top = theme.dash_calendar_pad_top * scale;
-    const pad_x = theme.dash_calendar_pad_x * scale;
     const title_fs = theme.dash_cal_title_font_size * scale;
     const week_fs = theme.dash_cal_week_font_size * scale;
+    var week_buf: [16]u8 = undefined;
+    const week_str = std.fmt.bufPrint(&week_buf, "Week {d}", .{dash.iso_week}) catch "";
+
+    // `.cal-head { justify-content: space-between }`: title pinned left,
+    // "Week N" pinned right.
+    var title_node: L.Node = .{ .width = .{ .fixed = @as(f64, @floatFromInt(dash.month_label.len)) * Theme.charWidth(title_fs) }, .height = .{ .fixed = title_fs } };
+    var week_node: L.Node = .{ .width = .{ .fixed = @as(f64, @floatFromInt(week_str.len)) * Theme.charWidth(week_fs) }, .height = .{ .fixed = week_fs } };
+    // `.cal-head { align-items: baseline }`: approximated by bottom-
+    // aligning the smaller "Week N" label against the title's box.
+    var cal_head: L.Node = .{ .axis = .row, .justify = .space_between, .align_items = .end, .height = .{ .fixed = title_fs }, .children = &.{ &title_node, &week_node } };
+
+    const wd_fs = theme.dash_cal_wd_font_size * scale;
+    var wd_slots: [7]L.Node = undefined;
+    var wd_ptrs: [7]*L.Node = undefined;
+    for (0..7) |i| {
+        wd_slots[i] = .{ .width = .{ .flex = 1 }, .height = .{ .fixed = wd_fs } };
+        wd_ptrs[i] = &wd_slots[i];
+    }
+    var wd_row: L.Node = .{ .axis = .row, .gap = theme.dash_cal_col_gap * scale, .height = .{ .fixed = wd_fs }, .children = &wd_ptrs };
+
+    const row_h = theme.dash_cal_row_h * scale;
+    var day_slots: [7]L.Node = undefined;
+    var day_ptrs: [7]*L.Node = undefined;
+    for (0..7) |i| {
+        day_slots[i] = .{ .width = .{ .flex = 1 }, .height = .{ .fixed = row_h } };
+        day_ptrs[i] = &day_slots[i];
+    }
+    var day_col_row: L.Node = .{ .axis = .row, .gap = theme.dash_cal_col_gap * scale, .height = .{ .fixed = row_h }, .children = &day_ptrs };
+
+    var grid: L.Node = .{ .height = .{ .fixed = row_h * @as(f64, @floatFromInt(dash.day_rows)) } };
+    var card: L.Node = .{
+        .axis = .column,
+        .gap = theme.dash_calendar_gap * scale,
+        .padding = .{ .top = theme.dash_calendar_pad_top * scale, .left = theme.dash_calendar_pad_x * scale, .right = theme.dash_calendar_pad_x * scale, .bottom = theme.dash_calendar_pad_bottom * scale },
+        .children = &.{ &cal_head, &wd_row, &grid },
+    };
+    L.layout(&card, outer);
+    // Column x/w are shared by the weekday header and every day row --
+    // resolve them once against the grid's width, independent of `wd_row`
+    // (which sits in `card`'s flow, one row above).
+    L.layout(&day_col_row, .{ .x = grid.result.x, .y = grid.result.y, .w = grid.result.w, .h = row_h });
 
     ctx.setFontSize(title_fs);
     ctx.setSourceToPixel(theme.text);
-    try ctx.showText(dash.month_label, x + pad_x, y + pad_top);
+    try ctx.showText(dash.month_label, title_node.result.x, title_node.result.y);
     ctx.resetPath();
 
-    var week_buf: [16]u8 = undefined;
-    const week_str = std.fmt.bufPrint(&week_buf, "Week {d}", .{dash.iso_week}) catch "";
     ctx.setFontSize(week_fs);
     ctx.setSourceToPixel(theme.faint);
-    // `.cal-head { align-items: baseline }`: the smaller "Week N" label
-    // sits on the title's baseline, not its top -- approximated here by
-    // aligning the two text tops to the title's vertical center.
-    try ctx.showText(week_str, x + w - pad_x - @as(f64, @floatFromInt(week_str.len)) * Theme.charWidth(week_fs), y + pad_top + (title_fs - week_fs) * 0.7);
+    try ctx.showText(week_str, week_node.result.x, week_node.result.y);
     ctx.resetPath();
 
-    const wd_fs = theme.dash_cal_wd_font_size * scale;
-    const col_gap = theme.dash_cal_col_gap * scale;
-    const col_w = (w - pad_x * 2 - col_gap * 6) / 7.0;
     const weekday_labels = [_][]const u8{ "Mo", "Tu", "We", "Th", "Fr", "Sa", "Su" };
-    const header_y = y + pad_top + title_fs + theme.dash_calendar_gap * scale;
     ctx.setFontSize(wd_fs);
     ctx.setSourceToPixel(theme.faint);
     for (weekday_labels, 0..) |lbl, i| {
-        const col_x = x + pad_x + (col_w + col_gap) * @as(f64, @floatFromInt(i));
+        const slot = wd_slots[i].result;
         const label_w = @as(f64, @floatFromInt(lbl.len)) * Theme.charWidth(wd_fs);
-        try ctx.showText(lbl, col_x + (col_w - label_w) / 2, header_y);
+        try ctx.showText(lbl, slot.x + (slot.w - label_w) / 2, slot.y);
         ctx.resetPath();
     }
 
     const day_fs = theme.dash_cal_day_font_size * scale;
     const day_char_w = Theme.charWidth(day_fs);
-    const row_h = theme.dash_cal_row_h * scale;
-    const grid_top = header_y + wd_fs + 4 * scale;
 
     for (dash.days, 0..) |cell, i| {
         if (cell.day == 0) continue;
         const row = i / 7;
         const col = i % 7;
-        const col_x = x + pad_x + (col_w + col_gap) * @as(f64, @floatFromInt(col));
-        const cell_y = grid_top + row_h * @as(f64, @floatFromInt(row));
+        const col_slot = day_ptrs[col].result;
+        const cell_y = grid.result.y + row_h * @as(f64, @floatFromInt(row));
         const cy = cell_y + (row_h - day_fs) / 2;
 
         var day_buf: [4]u8 = undefined;
         const day_str = std.fmt.bufPrint(&day_buf, "{d}", .{cell.day}) catch "";
         const day_w = @as(f64, @floatFromInt(day_str.len)) * day_char_w;
-        const cx = col_x + (col_w - day_w) / 2;
+        const cx = col_slot.x + (col_slot.w - day_w) / 2;
 
         if (cell.is_today) {
             ctx.setSourceToPixel(theme.accent);
-            try roundedRect(ctx, col_x, cell_y, col_w, row_h, 7 * scale);
+            try roundedRect(ctx, col_slot.x, cell_y, col_slot.w, row_h, 7 * scale);
             try ctx.fill();
             ctx.resetPath();
             ctx.setSourceToPixel(theme.panel_bg);
@@ -623,36 +693,46 @@ fn drawRecentSection(
     alloc: std.mem.Allocator,
     environ: ?*const std.process.Environ.Map,
     icon_cache: ?*icon_mod.Cache,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
+    outer: L.Rect,
     scale: f64,
 ) !void {
-    _ = h;
     const label_fs = theme.dash_recent_label_font_size * scale;
+    const tile_size = theme.icon_tile_size * scale;
+
+    var label_node: L.Node = .{ .height = .{ .fixed = label_fs } };
+    var slots: [5]L.Node = undefined;
+    var slot_ptrs: [5]*L.Node = undefined;
+    for (0..5) |i| {
+        slots[i] = .{ .width = .{ .flex = 1 } };
+        slot_ptrs[i] = &slots[i];
+    }
+    var tiles_row: L.Node = .{ .axis = .row, .children = &slot_ptrs };
+    var section: L.Node = .{
+        .axis = .column,
+        .gap = theme.dash_recent_gap * scale,
+        .padding = .{ .left = theme.dash_recent_label_pad_x * scale },
+        .children = &.{ &label_node, &tiles_row },
+    };
+    L.layout(&section, outer);
+
     ctx.setFontSize(label_fs);
     ctx.setSourceToPixel(theme.faint);
-    const label_x = x + theme.dash_recent_label_pad_x * scale;
-    try ctx.showText("RECENT", label_x, y);
+    try ctx.showText("RECENT", label_node.result.x, label_node.result.y);
     ctx.resetPath();
 
     const environ_ref = environ orelse return;
     const recents = history_mod.loadRecent(alloc, io, environ_ref, 5);
     if (recents.len == 0) return;
 
-    // 5 evenly spaced slots, icon tile centered on top, name centered
-    // below it -- like an Apps-tab row's tile, not a side-by-side pill.
-    const tiles_y = y + label_fs + theme.dash_recent_gap * scale;
-    const tile_size = theme.icon_tile_size * scale;
-    const max_slots: f64 = 5;
-    const slot_w = w / max_slots;
+    // Icon tile centered on top of each slot, name centered below it --
+    // like an Apps-tab row's tile, not a side-by-side pill.
+    const tiles_y = tiles_row.result.y;
     const name_fs = theme.dash_recent_name_font_size * scale;
     const name_char_w = Theme.charWidth(name_fs);
 
     for (recents, 0..) |entry, i| {
-        const slot_x = x + slot_w * @as(f64, @floatFromInt(i));
-        const tile_x = slot_x + (slot_w - tile_size) / 2;
+        const slot = slots[i].result;
+        const tile_x = slot.x + (slot.w - tile_size) / 2;
 
         const real_icon: ?icon_mod.Icon = blk: {
             const cache = icon_cache orelse break :blk null;
@@ -683,7 +763,7 @@ fn drawRecentSection(
 
         ctx.setFontSize(name_fs);
         ctx.setSourceToPixel(theme.text);
-        const max_chars: usize = @intFromFloat(@max(0.0, slot_w / name_char_w));
+        const max_chars: usize = @intFromFloat(@max(0.0, slot.w / name_char_w));
         var label = entry.label;
         var truncated = false;
         if (max_chars > 1 and label.len > max_chars) {
@@ -691,7 +771,7 @@ fn drawRecentSection(
             truncated = true;
         }
         const label_w_px = @as(f64, @floatFromInt(label.len)) * name_char_w + (if (truncated) name_char_w else 0);
-        const lx = slot_x + @max(0.0, (slot_w - label_w_px) / 2);
+        const lx = slot.x + @max(0.0, (slot.w - label_w_px) / 2);
         const ly = tiles_y + tile_size + 8 * scale;
         try ctx.showText(label, lx, ly);
         ctx.resetPath();
