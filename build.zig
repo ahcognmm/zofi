@@ -31,6 +31,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/core/root.zig"),
         .target = target,
         .optimize = optimize,
+        // dashboard.zig's calendar math goes through libc's time.h
+        // (localtime_r/strftime/mktime) rather than reimplementing a
+        // timezone-aware calendar from scratch.
+        .link_libc = true,
         .imports = &.{
             .{ .name = "z2d", .module = z2d.module("z2d") },
             .{ .name = "zigimg", .module = zigimg.module("zigimg") },

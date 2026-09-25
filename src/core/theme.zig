@@ -41,6 +41,11 @@ pub const Theme = struct {
     /// synthetic "open in browser" entry). Also used as the freedesktop
     /// icon name for that row's tile. Override with `$ZOFI_BROWSER`.
     browser_cmd: []const u8 = "firefox",
+    /// Bare `zofi` (no `-show`/`-dmenu`): shows the idle dashboard (clock,
+    /// calendar, recent apps) in place of the row list whenever the query
+    /// is empty. `-show drun` etc. never sets this, so their behavior is
+    /// unchanged.
+    dashboard_enabled: bool = false,
 
     // Panel
     panel_width: f64 = 640,
@@ -80,6 +85,57 @@ pub const Theme = struct {
     name_font_size: f64 = 15,
     subtitle_font_size: f64 = 12.5,
     compact_font_size: f64 = 14,
+
+    // Dashboard (idle default view: clock/date, calendar, recent apps).
+    // Numbers below are lifted 1:1 from the exported `zofi-home.html`
+    // design spec (same 640-wide unit system as `panel_width`).
+    dash_pad_top: f64 = 10, // .home padding-top
+    dash_pad_bottom: f64 = 6, // .home padding-bottom
+    dash_gap: f64 = 12, // .home gap (between .top and .recent)
+    dash_top_h: f64 = 290, // .top height (fixed, not proportional)
+    dash_col_gap: f64 = 12, // .top gap (left column <-> calendar)
+    dash_left_gap: f64 = 14, // .left gap (clock block <-> weather card)
+
+    dash_card_radius: f64 = 10,
+    dash_card_bg: z2d.Pixel = hex(0x1F2024), // --card (distinct from chip_track)
+
+    dash_clock_pad: f64 = 8, // .clock padding (left/right/top; bottom 0)
+    dash_clock_font_size: f64 = 60,
+    dash_clock_gap: f64 = 10, // gap between time and date
+    dash_date_font_size: f64 = 15,
+
+    dash_weather_pad_top: f64 = 14,
+    dash_weather_pad_x: f64 = 16,
+    dash_weather_pad_bottom: f64 = 12,
+    dash_weather_icon_size: f64 = 44,
+    dash_weather_now_gap: f64 = 14, // gap between icon/temp/condition block
+    dash_temp_font_size: f64 = 34,
+    dash_cond_font_size: f64 = 14, // condition name, e.g. "Partly cloudy"
+    dash_cond_gap: f64 = 3, // gap between condition name and location line
+    dash_loc_font_size: f64 = 12.5, // "Lisbon · H 23° L 15°"
+    dash_forecast_gap_top: f64 = 10,
+    dash_forecast_col_gap: f64 = 4,
+    dash_forecast_icon_size: f64 = 20,
+    dash_forecast_slot_gap: f64 = 5, // vertical gap within one forecast slot
+    dash_forecast_time_font_size: f64 = 11.5,
+    dash_forecast_temp_font_size: f64 = 13,
+
+    dash_calendar_width: f64 = 272, // fixed, not proportional
+    dash_calendar_pad_top: f64 = 14,
+    dash_calendar_pad_x: f64 = 14,
+    dash_calendar_pad_bottom: f64 = 10,
+    dash_calendar_gap: f64 = 8, // gap between cal-head and the day grid
+    dash_cal_title_font_size: f64 = 14,
+    dash_cal_week_font_size: f64 = 12,
+    dash_cal_wd_font_size: f64 = 11, // weekday header row (Mo Tu We...)
+    dash_cal_day_font_size: f64 = 13,
+    dash_cal_row_h: f64 = 30,
+    dash_cal_col_gap: f64 = 2,
+
+    dash_recent_gap: f64 = 6, // between "RECENT" label and the tile row
+    dash_recent_label_font_size: f64 = 11.5,
+    dash_recent_label_pad_x: f64 = 8,
+    dash_recent_name_font_size: f64 = 13.5,
 
     // Icon tile
     icon_tile_size: f64 = 28,

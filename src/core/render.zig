@@ -9,6 +9,9 @@ const state_mod = @import("state.zig");
 const State = state_mod.State;
 const fuzzy = @import("fuzzy.zig");
 const icon_mod = @import("icon.zig");
+const dashboard_mod = @import("dashboard.zig");
+const history_mod = @import("history.zig");
+const weather_mod = @import("weather.zig");
 
 pub const Size = struct { width: f64, height: f64 };
 
@@ -25,6 +28,7 @@ pub fn render(
     state: *State,
     scale: f64,
     icon_cache: ?*icon_mod.Cache,
+    environ: ?*const std.process.Environ.Map,
 ) !void {
     var ctx = z2d.Context.init(io, alloc, surface);
     defer ctx.deinit();
@@ -49,9 +53,17 @@ pub fn render(
     ctx.resetPath();
 
     const rows_top = sep_y + scale + theme.list_padding * scale;
-    try drawRows(&ctx, surface, theme, state, width, padding, rows_top, scale, icon_cache);
-
     const footer_y = height - theme.footer_height * scale;
+
+    // Windows/Run tabs always show their real list -- the idle dashboard
+    // (clock/calendar/recent apps) only makes sense as an Apps-tab landing
+    // page, never a replacement for "here are your open windows".
+    if (theme.dashboard_enabled and theme.active_tab == .apps and state.query.items.len == 0) {
+        try drawDashboard(&ctx, surface, theme, io, alloc, environ, icon_cache, width, padding, rows_top, footer_y, scale);
+    } else {
+        try drawRows(&ctx, surface, theme, state, width, padding, rows_top, scale, icon_cache);
+    }
+
     try drawFooter(&ctx, theme, state, width, padding, footer_y, theme.footer_height * scale, scale);
 }
 
@@ -230,6 +242,462 @@ fn drawRows(ctx: *z2d.Context, surface: *z2d.Surface, theme: *const Theme, state
             try drawCompactRow(ctx, theme, state, entry, result.index, row_y, row_h, width, padding, row_pad_x, font_size, char_w, selected, scale);
         } else {
             try drawTallRow(ctx, surface, theme, state, entry, result.index, row_y, row_h, width, padding, row_pad_x, font_size, char_w, scale, selected, icon_cache);
+        }
+    }
+}
+
+/// Idle-state view shown instead of the row list: clock/date + weather on
+/// the left, a calendar on the right, recently-launched apps along the
+/// bottom. Occupies the same rect the row list would. Box model lifted
+/// 1:1 from the exported `zofi-home.html` design spec.
+fn drawDashboard(
+    ctx: *z2d.Context,
+    surface: *z2d.Surface,
+    theme: *const Theme,
+    io: Io,
+    alloc: std.mem.Allocator,
+    environ: ?*const std.process.Environ.Map,
+    icon_cache: ?*icon_mod.Cache,
+    width: f64,
+    padding: f64,
+    content_top: f64,
+    content_bottom: f64,
+    scale: f64,
+) !void {
+    const dash = dashboard_mod.build(alloc) catch return;
+
+    const gap = theme.dash_gap * scale;
+    const inner_top = content_top + theme.dash_pad_top * scale;
+    const inner_bottom = content_bottom - theme.dash_pad_bottom * scale;
+
+    const content_x = padding;
+    const content_w = width - padding * 2;
+
+    const top_h = theme.dash_top_h * scale;
+    const recent_y = inner_top + top_h + gap;
+    const recent_h = inner_bottom - recent_y;
+
+    const col_gap = theme.dash_col_gap * scale;
+    const cal_w = theme.dash_calendar_width * scale;
+    const left_w = content_w - col_gap - cal_w;
+    const right_x = content_x + left_w + col_gap;
+
+    try drawClockAndWeather(ctx, theme, io, alloc, environ, dash, content_x, inner_top, left_w, top_h, scale);
+    try drawCalendarCard(ctx, theme, dash, right_x, inner_top, cal_w, top_h, scale);
+    try drawRecentSection(ctx, surface, theme, io, alloc, environ, icon_cache, content_x, recent_y, content_w, recent_h, scale);
+}
+
+/// Clips `text` to whatever whole number of characters fits in `avail_w`
+/// at `char_w` per character (monospace, so this is exact). No ellipsis --
+/// callers use this for supplementary text (weather condition/location)
+/// where silent clipping reads better than "Ho Chi Minh Ci…" in a narrow
+/// card.
+fn truncateToWidth(text: []const u8, avail_w: f64, char_w: f64) []const u8 {
+    if (char_w <= 0) return text;
+    const max_chars: usize = @intFromFloat(@max(0.0, avail_w / char_w));
+    return if (text.len > max_chars) text[0..max_chars] else text;
+}
+
+fn drawCard(ctx: *z2d.Context, theme: *const Theme, x: f64, y: f64, w: f64, h: f64, scale: f64) !void {
+    ctx.setSourceToPixel(theme.dash_card_bg);
+    try roundedRect(ctx, x, y, w, h, theme.dash_card_radius * scale);
+    try ctx.fill();
+    ctx.resetPath();
+}
+
+fn drawClockAndWeather(
+    ctx: *z2d.Context,
+    theme: *const Theme,
+    io: Io,
+    alloc: std.mem.Allocator,
+    environ: ?*const std.process.Environ.Map,
+    dash: dashboard_mod.Dashboard,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    scale: f64,
+) !void {
+    const clock_pad = theme.dash_clock_pad * scale;
+    const clock_x = x + clock_pad;
+    const clock_fs = theme.dash_clock_font_size * scale;
+    ctx.setFontSize(clock_fs);
+    ctx.setSourceToPixel(theme.text);
+    var clock_buf: [8]u8 = undefined;
+    const clock_str = std.fmt.bufPrint(&clock_buf, "{d:0>2}:{d:0>2}", .{ dash.hour, dash.minute }) catch "";
+    try ctx.showText(clock_str, clock_x, y + clock_pad);
+    ctx.resetPath();
+
+    const date_fs = theme.dash_date_font_size * scale;
+    ctx.setFontSize(date_fs);
+    ctx.setSourceToPixel(theme.dim);
+    const date_y = y + clock_pad + clock_fs + theme.dash_clock_gap * scale;
+    try ctx.showText(dash.weekday_date, clock_x, date_y);
+    ctx.resetPath();
+
+    // .clock's own box (padding 8/8/0/8, i.e. no bottom padding) ends right
+    // after the date line; .left's `gap: 14` then leads into the card.
+    const card_y = date_y + date_fs + theme.dash_left_gap * scale;
+    const card_h = (y + h) - card_y;
+    if (card_h <= 0) return;
+
+    const weather = if (environ) |e| weather_mod.loadCached(alloc, io, e) else null;
+    try drawWeatherCard(ctx, theme, weather, x, card_y, w, card_h, scale);
+}
+
+fn drawWeatherCard(ctx: *z2d.Context, theme: *const Theme, weather: ?weather_mod.Weather, x: f64, y: f64, w: f64, h: f64, scale: f64) !void {
+    try drawCard(ctx, theme, x, y, w, h, scale);
+
+    const pad_top = theme.dash_weather_pad_top * scale;
+    const pad_x = theme.dash_weather_pad_x * scale;
+    const pad_bottom = theme.dash_weather_pad_bottom * scale;
+
+    const wx = weather orelse {
+        ctx.setFontSize(theme.dash_cond_font_size * scale);
+        ctx.setSourceToPixel(theme.faint);
+        try ctx.showText("Weather unavailable", x + pad_x, y + pad_top);
+        ctx.resetPath();
+        return;
+    };
+
+    const icon_size = theme.dash_weather_icon_size * scale;
+    const temp_fs = theme.dash_temp_font_size * scale;
+    const cond_fs = theme.dash_cond_font_size * scale;
+    const loc_fs = theme.dash_loc_font_size * scale;
+    const now_gap = theme.dash_weather_now_gap * scale;
+    const cond_gap = theme.dash_cond_gap * scale;
+
+    // "now" row (icon, temp, condition/location) pinned to the card's top;
+    // the forecast row (below) is pinned to its bottom -- `justify-content:
+    // space-between` in the original design -- with whatever's left as
+    // plain empty card between them, not a broken-looking half-empty box.
+    const row_top = y + pad_top;
+    const row_h = @max(icon_size, cond_fs + cond_gap + loc_fs);
+    const row_cy = row_top + row_h / 2;
+
+    const icon_x = x + pad_x;
+    try drawWeatherIcon(ctx, theme, weather_mod.iconFor(wx.code), icon_x, row_cy - icon_size / 2, icon_size, scale);
+
+    const temp_x = icon_x + icon_size + now_gap;
+    ctx.setFontSize(temp_fs);
+    ctx.setSourceToPixel(theme.text);
+    var temp_buf: [16]u8 = undefined;
+    const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.0}\xC2\xB0", .{wx.temp_c}) catch ""; // "°"
+    try ctx.showText(temp_str, temp_x, row_cy - temp_fs / 2);
+    ctx.resetPath();
+
+    const cond_x = temp_x + @as(f64, @floatFromInt(temp_str.len)) * Theme.charWidth(temp_fs) + now_gap;
+    const cond_avail_w = (x + w - pad_x) - cond_x;
+    const cond_block_h = cond_fs + cond_gap + loc_fs;
+    const cond_y = row_cy - cond_block_h / 2;
+    ctx.setFontSize(cond_fs);
+    ctx.setSourceToPixel(theme.text);
+    try ctx.showText(truncateToWidth(wx.condition(), cond_avail_w, Theme.charWidth(cond_fs)), cond_x, cond_y);
+    ctx.resetPath();
+
+    ctx.setFontSize(loc_fs);
+    ctx.setSourceToPixel(theme.dim);
+    var loc_buf: [96]u8 = undefined;
+    const loc_str = std.fmt.bufPrint(&loc_buf, "{s} \xC2\xB7 H {d:.0}\xC2\xB0 L {d:.0}\xC2\xB0", .{ wx.city, wx.high_c, wx.low_c }) catch "";
+    try ctx.showText(truncateToWidth(loc_str, cond_avail_w, Theme.charWidth(loc_fs)), cond_x, cond_y + cond_fs + cond_gap);
+    ctx.resetPath();
+
+    if (wx.hourly.len == 0) return;
+
+    const time_fs = theme.dash_forecast_time_font_size * scale;
+    const val_fs = theme.dash_forecast_temp_font_size * scale;
+    const forecast_icon_size = theme.dash_forecast_icon_size * scale;
+    const slot_gap = theme.dash_forecast_slot_gap * scale;
+    const forecast_h = time_fs + slot_gap + forecast_icon_size + slot_gap + val_fs;
+
+    const rule_y = (y + h) - pad_bottom - forecast_h - theme.dash_forecast_gap_top * scale;
+    ctx.setSourceToPixel(theme.border);
+    try fillRect(ctx, x + pad_x, rule_y, w - pad_x * 2, @max(1.0, scale));
+    ctx.resetPath();
+
+    const forecast_top = rule_y + theme.dash_forecast_gap_top * scale;
+    const col_gap = theme.dash_forecast_col_gap * scale;
+    const slot_w = (w - pad_x * 2 - col_gap * @as(f64, @floatFromInt(wx.hourly.len - 1))) / @as(f64, @floatFromInt(wx.hourly.len));
+    var i: usize = 0;
+    while (i < wx.hourly.len) : (i += 1) {
+        const hf = wx.hourly[i];
+        const slot_x = x + pad_x + (slot_w + col_gap) * @as(f64, @floatFromInt(i));
+        const slot_cx = slot_x + slot_w / 2;
+
+        ctx.setFontSize(time_fs);
+        ctx.setSourceToPixel(theme.faint);
+        const time_w = @as(f64, @floatFromInt(hf.label.len)) * Theme.charWidth(time_fs);
+        try ctx.showText(hf.label, slot_cx - time_w / 2, forecast_top);
+        ctx.resetPath();
+
+        const hi_y = forecast_top + time_fs + slot_gap;
+        try drawWeatherIcon(ctx, theme, weather_mod.iconFor(hf.code), slot_cx - forecast_icon_size / 2, hi_y, forecast_icon_size, scale);
+
+        var htemp_buf: [16]u8 = undefined;
+        const htemp_str = std.fmt.bufPrint(&htemp_buf, "{d:.0}\xC2\xB0", .{hf.temp_c}) catch "";
+        ctx.setFontSize(val_fs);
+        ctx.setSourceToPixel(theme.text);
+        const val_w = @as(f64, @floatFromInt(htemp_str.len)) * Theme.charWidth(val_fs);
+        try ctx.showText(htemp_str, slot_cx - val_w / 2, hi_y + forecast_icon_size + slot_gap);
+        ctx.resetPath();
+    }
+}
+
+/// Small hand-drawn pictograms -- z2d has no image pattern to fill a shape
+/// with (see `blitIcon`), and pulling in bitmap weather icon assets for
+/// half a dozen glyphs isn't worth a new dependency.
+fn drawWeatherIcon(ctx: *z2d.Context, theme: *const Theme, icon: weather_mod.Icon, x: f64, y: f64, icon_size: f64, scale: f64) !void {
+    const cx = x + icon_size / 2;
+    const cy = y + icon_size / 2;
+
+    switch (icon) {
+        .sun => {
+            ctx.setSourceToPixel(theme.accent);
+            const r = icon_size * 0.28;
+            try ctx.arc(cx, cy, r, 0, std.math.pi * 2);
+            try ctx.closePath();
+            try ctx.fill();
+            ctx.resetPath();
+            ctx.setLineWidth(@max(1.0, 1.2 * scale));
+            var ray: usize = 0;
+            while (ray < 8) : (ray += 1) {
+                const a = @as(f64, @floatFromInt(ray)) * (std.math.pi / 4.0);
+                const x0 = cx + @cos(a) * r * 1.4;
+                const y0 = cy + @sin(a) * r * 1.4;
+                const x1 = cx + @cos(a) * r * 1.9;
+                const y1 = cy + @sin(a) * r * 1.9;
+                try ctx.moveTo(x0, y0);
+                try ctx.lineTo(x1, y1);
+                try ctx.stroke();
+                ctx.resetPath();
+            }
+        },
+        .cloud, .part_cloud, .fog, .rain, .snow, .thunder => {
+            if (icon == .part_cloud) {
+                ctx.setSourceToPixel(theme.accent);
+                const r = icon_size * 0.22;
+                try ctx.arc(cx - icon_size * 0.18, cy - icon_size * 0.18, r, 0, std.math.pi * 2);
+                try ctx.closePath();
+                try ctx.fill();
+                ctx.resetPath();
+            }
+            ctx.setSourceToPixel(theme.dim);
+            const body_y = cy + icon_size * 0.08;
+            try ctx.arc(cx - icon_size * 0.16, body_y, icon_size * 0.2, std.math.pi * 0.5, std.math.pi * 1.75);
+            try ctx.arc(cx + icon_size * 0.08, body_y - icon_size * 0.1, icon_size * 0.24, std.math.pi * 1.15, std.math.pi * 2.15);
+            try ctx.lineTo(cx + icon_size * 0.34, body_y + icon_size * 0.22);
+            try ctx.lineTo(cx - icon_size * 0.16, body_y + icon_size * 0.22);
+            try ctx.closePath();
+            try ctx.fill();
+            ctx.resetPath();
+
+            switch (icon) {
+                .rain => {
+                    ctx.setSourceToPixel(theme.faint);
+                    ctx.setLineWidth(@max(1.0, 1.2 * scale));
+                    var d: usize = 0;
+                    while (d < 3) : (d += 1) {
+                        const dx = cx - icon_size * 0.12 + @as(f64, @floatFromInt(d)) * icon_size * 0.16;
+                        try ctx.moveTo(dx, body_y + icon_size * 0.3);
+                        try ctx.lineTo(dx - icon_size * 0.05, body_y + icon_size * 0.46);
+                        try ctx.stroke();
+                        ctx.resetPath();
+                    }
+                },
+                .snow => {
+                    ctx.setSourceToPixel(theme.faint);
+                    var d: usize = 0;
+                    while (d < 3) : (d += 1) {
+                        const dx = cx - icon_size * 0.12 + @as(f64, @floatFromInt(d)) * icon_size * 0.16;
+                        const dy = body_y + icon_size * 0.38;
+                        try ctx.arc(dx, dy, @max(0.8 * scale, icon_size * 0.03), 0, std.math.pi * 2);
+                        try ctx.closePath();
+                        try ctx.fill();
+                        ctx.resetPath();
+                    }
+                },
+                .fog => {
+                    ctx.setSourceToPixel(theme.faint);
+                    ctx.setLineWidth(@max(1.0, 1.2 * scale));
+                    var d: usize = 0;
+                    while (d < 2) : (d += 1) {
+                        const dy = body_y + icon_size * 0.3 + @as(f64, @floatFromInt(d)) * icon_size * 0.14;
+                        try ctx.moveTo(cx - icon_size * 0.22, dy);
+                        try ctx.lineTo(cx + icon_size * 0.22, dy);
+                        try ctx.stroke();
+                        ctx.resetPath();
+                    }
+                },
+                .thunder => {
+                    ctx.setSourceToPixel(theme.accent);
+                    try ctx.moveTo(cx + icon_size * 0.02, body_y + icon_size * 0.24);
+                    try ctx.lineTo(cx - icon_size * 0.1, body_y + icon_size * 0.46);
+                    try ctx.lineTo(cx + icon_size * 0.02, body_y + icon_size * 0.46);
+                    try ctx.lineTo(cx - icon_size * 0.08, body_y + icon_size * 0.68);
+                    try ctx.lineTo(cx + icon_size * 0.16, body_y + icon_size * 0.4);
+                    try ctx.lineTo(cx + icon_size * 0.04, body_y + icon_size * 0.4);
+                    try ctx.closePath();
+                    try ctx.fill();
+                    ctx.resetPath();
+                },
+                else => {},
+            }
+        },
+    }
+}
+
+fn drawCalendarCard(ctx: *z2d.Context, theme: *const Theme, dash: dashboard_mod.Dashboard, x: f64, y: f64, w: f64, h: f64, scale: f64) !void {
+    try drawCard(ctx, theme, x, y, w, h, scale);
+
+    const pad_top = theme.dash_calendar_pad_top * scale;
+    const pad_x = theme.dash_calendar_pad_x * scale;
+    const title_fs = theme.dash_cal_title_font_size * scale;
+    const week_fs = theme.dash_cal_week_font_size * scale;
+
+    ctx.setFontSize(title_fs);
+    ctx.setSourceToPixel(theme.text);
+    try ctx.showText(dash.month_label, x + pad_x, y + pad_top);
+    ctx.resetPath();
+
+    var week_buf: [16]u8 = undefined;
+    const week_str = std.fmt.bufPrint(&week_buf, "Week {d}", .{dash.iso_week}) catch "";
+    ctx.setFontSize(week_fs);
+    ctx.setSourceToPixel(theme.faint);
+    // `.cal-head { align-items: baseline }`: the smaller "Week N" label
+    // sits on the title's baseline, not its top -- approximated here by
+    // aligning the two text tops to the title's vertical center.
+    try ctx.showText(week_str, x + w - pad_x - @as(f64, @floatFromInt(week_str.len)) * Theme.charWidth(week_fs), y + pad_top + (title_fs - week_fs) * 0.7);
+    ctx.resetPath();
+
+    const wd_fs = theme.dash_cal_wd_font_size * scale;
+    const col_gap = theme.dash_cal_col_gap * scale;
+    const col_w = (w - pad_x * 2 - col_gap * 6) / 7.0;
+    const weekday_labels = [_][]const u8{ "Mo", "Tu", "We", "Th", "Fr", "Sa", "Su" };
+    const header_y = y + pad_top + title_fs + theme.dash_calendar_gap * scale;
+    ctx.setFontSize(wd_fs);
+    ctx.setSourceToPixel(theme.faint);
+    for (weekday_labels, 0..) |lbl, i| {
+        const col_x = x + pad_x + (col_w + col_gap) * @as(f64, @floatFromInt(i));
+        const label_w = @as(f64, @floatFromInt(lbl.len)) * Theme.charWidth(wd_fs);
+        try ctx.showText(lbl, col_x + (col_w - label_w) / 2, header_y);
+        ctx.resetPath();
+    }
+
+    const day_fs = theme.dash_cal_day_font_size * scale;
+    const day_char_w = Theme.charWidth(day_fs);
+    const row_h = theme.dash_cal_row_h * scale;
+    const grid_top = header_y + wd_fs + 4 * scale;
+
+    for (dash.days, 0..) |cell, i| {
+        if (cell.day == 0) continue;
+        const row = i / 7;
+        const col = i % 7;
+        const col_x = x + pad_x + (col_w + col_gap) * @as(f64, @floatFromInt(col));
+        const cell_y = grid_top + row_h * @as(f64, @floatFromInt(row));
+        const cy = cell_y + (row_h - day_fs) / 2;
+
+        var day_buf: [4]u8 = undefined;
+        const day_str = std.fmt.bufPrint(&day_buf, "{d}", .{cell.day}) catch "";
+        const day_w = @as(f64, @floatFromInt(day_str.len)) * day_char_w;
+        const cx = col_x + (col_w - day_w) / 2;
+
+        if (cell.is_today) {
+            ctx.setSourceToPixel(theme.accent);
+            try roundedRect(ctx, col_x, cell_y, col_w, row_h, 7 * scale);
+            try ctx.fill();
+            ctx.resetPath();
+            ctx.setSourceToPixel(theme.panel_bg);
+        } else {
+            ctx.setSourceToPixel(theme.text);
+        }
+        try ctx.showText(day_str, cx, cy);
+        ctx.resetPath();
+    }
+}
+
+fn drawRecentSection(
+    ctx: *z2d.Context,
+    surface: *z2d.Surface,
+    theme: *const Theme,
+    io: Io,
+    alloc: std.mem.Allocator,
+    environ: ?*const std.process.Environ.Map,
+    icon_cache: ?*icon_mod.Cache,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    scale: f64,
+) !void {
+    _ = h;
+    const label_fs = theme.dash_recent_label_font_size * scale;
+    ctx.setFontSize(label_fs);
+    ctx.setSourceToPixel(theme.faint);
+    const label_x = x + theme.dash_recent_label_pad_x * scale;
+    try ctx.showText("RECENT", label_x, y);
+    ctx.resetPath();
+
+    const environ_ref = environ orelse return;
+    const recents = history_mod.loadRecent(alloc, io, environ_ref, 5);
+    if (recents.len == 0) return;
+
+    // 5 evenly spaced slots, icon tile centered on top, name centered
+    // below it -- like an Apps-tab row's tile, not a side-by-side pill.
+    const tiles_y = y + label_fs + theme.dash_recent_gap * scale;
+    const tile_size = theme.icon_tile_size * scale;
+    const max_slots: f64 = 5;
+    const slot_w = w / max_slots;
+    const name_fs = theme.dash_recent_name_font_size * scale;
+    const name_char_w = Theme.charWidth(name_fs);
+
+    for (recents, 0..) |entry, i| {
+        const slot_x = x + slot_w * @as(f64, @floatFromInt(i));
+        const tile_x = slot_x + (slot_w - tile_size) / 2;
+
+        const real_icon: ?icon_mod.Icon = blk: {
+            const cache = icon_cache orelse break :blk null;
+            const name = entry.icon_name orelse break :blk null;
+            break :blk cache.get(name);
+        };
+
+        if (real_icon) |img| {
+            blitIcon(surface, img, tile_x, tiles_y, tile_size);
+        } else {
+            ctx.setSourceToPixel(theme_mod.icon_palette[i % theme_mod.icon_palette.len]);
+            try roundedRect(ctx, tile_x, tiles_y, tile_size, tile_size, theme.icon_tile_radius * scale);
+            try ctx.fill();
+            ctx.resetPath();
+
+            if (entry.label.len > 0) {
+                const letter_fs = theme.icon_letter_size * scale;
+                ctx.setFontSize(letter_fs);
+                ctx.setSourceToPixel(.{ .rgba = (z2d.pixel.RGBA{ .r = 255, .g = 255, .b = 255, .a = 255 }).multiply() });
+                var upper_buf: [4]u8 = undefined;
+                const first_len = std.unicode.utf8ByteSequenceLength(entry.label[0]) catch 1;
+                const letter = std.ascii.upperString(&upper_buf, entry.label[0..@min(first_len, entry.label.len)]);
+                const letter_char_w = Theme.charWidth(letter_fs);
+                try ctx.showText(letter, tile_x + (tile_size - letter_char_w) / 2, tiles_y + (tile_size - letter_fs) / 2);
+                ctx.resetPath();
+            }
+        }
+
+        ctx.setFontSize(name_fs);
+        ctx.setSourceToPixel(theme.text);
+        const max_chars: usize = @intFromFloat(@max(0.0, slot_w / name_char_w));
+        var label = entry.label;
+        var truncated = false;
+        if (max_chars > 1 and label.len > max_chars) {
+            label = label[0 .. max_chars - 1];
+            truncated = true;
+        }
+        const label_w_px = @as(f64, @floatFromInt(label.len)) * name_char_w + (if (truncated) name_char_w else 0);
+        const lx = slot_x + @max(0.0, (slot_w - label_w_px) / 2);
+        const ly = tiles_y + tile_size + 8 * scale;
+        try ctx.showText(label, lx, ly);
+        ctx.resetPath();
+        if (truncated) {
+            try ctx.showText("\xE2\x80\xA6", lx + @as(f64, @floatFromInt(label.len)) * name_char_w, ly);
+            ctx.resetPath();
         }
     }
 }

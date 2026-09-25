@@ -601,7 +601,7 @@ fn presentFrame(app: *App) !bool {
     }
 
     var surface = core_z2d.Surface.initBuffer(.image_surface_argb, null, buf.pixels, app.width, app.height);
-    try core.render.render(app.io, app.allocator, &surface, &app.theme, &app.state, 1.0, if (app.icon_cache) |*cache| cache else null);
+    try core.render.render(app.io, app.allocator, &surface, &app.theme, &app.state, 1.0, if (app.icon_cache) |*cache| cache else null, app.environ);
 
     c.wl_surface_attach(app.surface, buf.wl_buffer, 0, 0);
     c.wl_surface_damage_buffer(app.surface, 0, 0, app.width, app.height);
