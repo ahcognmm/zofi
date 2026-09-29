@@ -258,7 +258,11 @@ fn runLauncher(
             theme.placeholder = "Search windows";
         },
         .clipboard => {
-            theme.compact_rows = true;
+            // Split-pane view (render.zig's drawClipboardSplit), not the
+            // compact single-line list -- see backend.zig's cycleMode for
+            // why compact_rows must match whatever row height that view
+            // actually uses.
+            theme.compact_rows = false;
             theme.active_tab = .clipboard;
             theme.placeholder = "Search clipboard history";
         },

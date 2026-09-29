@@ -142,6 +142,17 @@ pub const Theme = struct {
     icon_tile_radius: f64 = 7,
     icon_letter_size: f64 = 13,
 
+    // Clipboard tab: split list + preview pane (zofi-clipboard.html).
+    // Rows reuse `row_height_tall`/`icon_tile_size` above (the mockup's
+    // 48px row height and 28px tile match those exactly); these are the
+    // pane-specific numbers on top of that.
+    clip_list_w: f64 = 300, // .list width
+    clip_gap: f64 = 12, // gap either side of the vertical rule
+    clip_stage_h: f64 = 196, // .stage height
+    clip_preview_gap: f64 = 14, // .preview gap (between stage and meta list)
+    clip_meta_gap: f64 = 8, // .meta gap (between dt/dd rows)
+    clip_meta_font_size: f64 = 12.5,
+
     // Footer
     footer_height: f64 = 34,
     footer_pad_x: f64 = 12,

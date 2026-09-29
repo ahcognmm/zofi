@@ -104,6 +104,12 @@ pub const App = struct {
     /// Lazily-populated real-icon lookup for Apps/Windows rows; null when
     /// there's no environ to search with (dmenu).
     icon_cache: ?core.icon.Cache = null,
+
+    /// Lazily-populated content/decode cache for the clipboard tab's
+    /// preview pane, keyed by the selected row's id. Always present (not
+    /// optional): cheap to zero-init, and only ever touched while
+    /// `mode == .clipboard`.
+    clipboard_preview: core.clipboard.PreviewCache = .{},
 };
 
 pub const LauncherMode = enum {
@@ -605,7 +611,7 @@ fn presentFrame(app: *App) !bool {
     }
 
     var surface = core_z2d.Surface.initBuffer(.image_surface_argb, null, buf.pixels, app.width, app.height);
-    try core.render.render(app.io, app.allocator, &surface, &app.theme, &app.state, 1.0, if (app.icon_cache) |*cache| cache else null, app.environ);
+    try core.render.render(app.io, app.allocator, &surface, &app.theme, &app.state, 1.0, if (app.icon_cache) |*cache| cache else null, app.environ, &app.clipboard_preview);
 
     c.wl_surface_attach(app.surface, buf.wl_buffer, 0, 0);
     c.wl_surface_damage_buffer(app.surface, 0, 0, app.width, app.height);
@@ -701,6 +707,16 @@ fn processKeycode(app: *App, wayland_keycode: u32) !void {
     if (sym == c.XKB_KEY_Tab and app.mode != null) {
         const shift_active = c.xkb_state_mod_name_is_active(st, c.XKB_MOD_NAME_SHIFT, c.XKB_STATE_MODS_EFFECTIVE) == 1;
         try cycleMode(app, shift_active);
+        return;
+    }
+
+    // Only meaningful on the clipboard tab (remove the selected history
+    // entry) -- intercepted here rather than routed through
+    // `state.handleKey` since it needs DB access and a full entry-list
+    // rebuild, both backend concerns `state.zig` deliberately has no way
+    // to reach.
+    if (sym == c.XKB_KEY_Delete and app.mode == .clipboard) {
+        try deleteSelectedClipboardEntry(app);
         return;
     }
 
@@ -894,15 +910,13 @@ fn cycleMode(app: *App, backward: bool) !void {
         },
     };
 
-    const query = try app.allocator.dupe(u8, app.state.query.items);
-    app.state.deinit();
-    app.state = try core.state.State.init(app.allocator, entries);
-    try app.state.setQuery(query);
-    app.state.visible_rows = app.theme.visibleRows();
-    app.state.browser = app.theme.browser_cmd;
-
     app.mode = next_mode;
-    app.theme.compact_rows = next_mode == .run or next_mode == .clipboard;
+    // Clipboard rows aren't drawn by `drawRows` at all (see
+    // `render.zig`'s `drawClipboardSplit`, which always uses the tall
+    // 48px row height) -- `compact_rows` only matters here for
+    // `Theme.visibleRows()`'s scroll/paging math, which must agree with
+    // whatever row height that split view actually uses.
+    app.theme.compact_rows = next_mode == .run;
     app.theme.active_tab = switch (next_mode) {
         .drun => .apps,
         .run => .run,
@@ -916,8 +930,59 @@ fn cycleMode(app: *App, backward: bool) !void {
         .clipboard => "Search clipboard history",
     };
 
+    // Must run after the `compact_rows`/`active_tab` assignments above,
+    // not before: `visibleRows()` reads `compact_rows`, and computing it
+    // off the *previous* tab's value left scroll/paging one switch behind
+    // (harmless when every tab used the same row height, load-bearing now
+    // that clipboard's split view has its own).
+    const query = try app.allocator.dupe(u8, app.state.query.items);
+    app.state.deinit();
+    app.state = try core.state.State.init(app.allocator, entries);
+    try app.state.setQuery(query);
+    app.state.visible_rows = app.theme.visibleRows();
+    app.state.browser = app.theme.browser_cmd;
+
     app.need_redraw = true;
     dbg(app, "cycleMode: switched to {t}, {d} entries", .{ next_mode, entries.len });
+}
+
+/// Deletes the currently selected clipboard-tab entry (the Del key) and
+/// rebuilds `app.state` with the refreshed history, same shape as
+/// `cycleMode`'s rebuild but without switching modes. No-op if nothing's
+/// selected or the accept marker can't be parsed.
+fn deleteSelectedClipboardEntry(app: *App) !void {
+    const entry = app.state.selectedEntry() orelse return;
+    const marker = entry.action orelse return;
+    const id = core.clipboard.parseMarker(marker) catch |err| {
+        dbg(app, "deleteSelectedClipboardEntry: bad marker {s}: {t}", .{ marker, err });
+        return;
+    };
+
+    const environ = app.environ.?;
+    var db = core.clipboard.open(app.allocator, app.io, environ) catch |err| {
+        dbg(app, "deleteSelectedClipboardEntry: open failed: {t}", .{err});
+        return;
+    };
+    defer db.close();
+    core.clipboard.deleteEntry(db, id) catch |err| {
+        dbg(app, "deleteSelectedClipboardEntry: delete failed: {t}", .{err});
+        return;
+    };
+    app.clipboard_preview.invalidate(id);
+
+    const entries = core.sources.clipboard.toEntries(app.allocator, app.io, environ) catch |err| {
+        dbg(app, "deleteSelectedClipboardEntry: rescan failed: {t}", .{err});
+        return;
+    };
+    const query = try app.allocator.dupe(u8, app.state.query.items);
+    app.state.deinit();
+    app.state = try core.state.State.init(app.allocator, entries);
+    try app.state.setQuery(query);
+    app.state.visible_rows = app.theme.visibleRows();
+    app.state.browser = app.theme.browser_cmd;
+
+    app.need_redraw = true;
+    dbg(app, "deleteSelectedClipboardEntry: deleted id={d}, {d} entries left", .{ id, entries.len });
 }
 
 /// Snapshots the live `app.toplevels` list into entries, filling
