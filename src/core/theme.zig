@@ -25,7 +25,7 @@ pub const icon_palette = [_]z2d.Pixel{
     hex(0x7A3F55), // maroon/rose
 };
 
-pub const Tab = enum { apps, run, windows };
+pub const Tab = enum { apps, run, windows, clipboard };
 
 pub const Theme = struct {
     // Mode chrome (not shown in dmenu mode)

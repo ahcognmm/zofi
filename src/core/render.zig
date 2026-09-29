@@ -181,7 +181,7 @@ fn drawPrompt(ctx: *z2d.Context, theme: *const Theme, state: *State, width: f64,
 }
 
 fn drawTabs(ctx: *z2d.Context, theme: *const Theme, width: f64, padding: f64, prompt_h: f64, scale: f64) !void {
-    const labels = [_][]const u8{ "Apps", "Run", "Windows" };
+    const labels = [_][]const u8{ "Apps", "Run", "Windows", "Clipboard" };
     const chip_fs = theme.mode_chip_font_size * scale;
     const chip_pad_x = theme.mode_chip_pad_x * scale;
     const chip_h = theme.mode_chip_height * scale;
@@ -214,6 +214,7 @@ fn drawTabs(ctx: *z2d.Context, theme: *const Theme, width: f64, padding: f64, pr
         .apps => 0,
         .run => 1,
         .windows => 2,
+        .clipboard => 3,
     };
 
     for (labels, 0..) |l, i| {
@@ -722,7 +723,7 @@ fn drawCompactRow(
 
     var right_text: ?[]const u8 = null;
     if (entry.action) |a| {
-        if (!std.mem.eql(u8, a, entry.label)) right_text = a;
+        if (!entry.is_clipboard_marker and !std.mem.eql(u8, a, entry.label)) right_text = a;
     }
     // Values sourced from e.g. dmenu's `-display-columns` may still carry
     // the raw separator (a tab), which has no glyph in the monospace font

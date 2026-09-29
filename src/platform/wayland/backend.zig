@@ -15,6 +15,7 @@ pub const c = @cImport({
     @cInclude("xdg-shell-client-protocol.h");
     @cInclude("wlr-layer-shell-unstable-v1-client-protocol.h");
     @cInclude("wlr-foreign-toplevel-management-unstable-v1-client-protocol.h");
+    @cInclude("wlr-data-control-unstable-v1-client-protocol.h");
     @cInclude("xkbcommon/xkbcommon.h");
 });
 
@@ -109,20 +110,23 @@ pub const LauncherMode = enum {
     drun,
     run,
     windows,
+    clipboard,
 
     fn next(self: LauncherMode) LauncherMode {
         return switch (self) {
             .drun => .run,
             .run => .windows,
-            .windows => .drun,
+            .windows => .clipboard,
+            .clipboard => .drun,
         };
     }
 
     fn prev(self: LauncherMode) LauncherMode {
         return switch (self) {
-            .drun => .windows,
+            .drun => .clipboard,
             .run => .drun,
             .windows => .run,
+            .clipboard => .windows,
         };
     }
 };
@@ -884,6 +888,10 @@ fn cycleMode(app: *App, backward: bool) !void {
             return;
         },
         .windows => try buildWindowEntries(app),
+        .clipboard => core.sources.clipboard.toEntries(app.allocator, app.io, environ) catch |err| {
+            dbg(app, "cycleMode: clipboard scan failed: {t}", .{err});
+            return;
+        },
     };
 
     const query = try app.allocator.dupe(u8, app.state.query.items);
@@ -894,16 +902,18 @@ fn cycleMode(app: *App, backward: bool) !void {
     app.state.browser = app.theme.browser_cmd;
 
     app.mode = next_mode;
-    app.theme.compact_rows = next_mode == .run;
+    app.theme.compact_rows = next_mode == .run or next_mode == .clipboard;
     app.theme.active_tab = switch (next_mode) {
         .drun => .apps,
         .run => .run,
         .windows => .windows,
+        .clipboard => .clipboard,
     };
     app.theme.placeholder = switch (next_mode) {
         .drun => "Search apps",
         .run => "Search commands",
         .windows => "Search windows",
+        .clipboard => "Search clipboard history",
     };
 
     app.need_redraw = true;
@@ -942,4 +952,190 @@ fn buildWindowEntries(app: *App) ![]core.state.Entry {
 
     app.window_handles = try handles.toOwnedSlice(app.allocator);
     return entries.toOwnedSlice(app.allocator);
+}
+
+// ---------------------------------------------------------------------
+// Clipboard daemon: `zofi --clipboard-daemon`. A separate, long-running
+// Wayland client -- no layer-shell surface, no rendering, no keyboard grab
+// -- that listens for clipboard changes via zwlr_data_control_manager_v1
+// and writes them into core.clipboard's SQLite history. Meant to be
+// started once (e.g. by a systemd --user unit, see
+// contrib/systemd/zofi-clipboard.service), not spawned per zofi launch.
+// Deliberately its own minimal connect/registry/dispatch loop rather than
+// reusing App/eventLoop above: there's no surface to configure, no frames
+// to present, and nothing else to poll for.
+
+const ClipboardDaemon = struct {
+    allocator: std.mem.Allocator,
+    io: Io,
+    display: *c.wl_display,
+    debug: bool,
+    manager: ?*c.zwlr_data_control_manager_v1 = null,
+    seat: ?*c.wl_seat = null,
+    db: core.clipboard.Db = undefined,
+};
+
+fn dbgDaemon(d: *const ClipboardDaemon, comptime fmt: []const u8, args: anytype) void {
+    if (!d.debug) return;
+    std.debug.print(fmt ++ "\n", args);
+}
+
+pub fn runClipboardDaemon(allocator: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, debug: bool) !void {
+    const display = c.wl_display_connect(null) orelse return error.NoWaylandDisplay;
+    defer c.wl_display_disconnect(display);
+    const registry = c.wl_display_get_registry(display) orelse return error.NoRegistry;
+
+    var d: ClipboardDaemon = .{ .allocator = allocator, .io = io, .display = display, .debug = debug };
+    _ = c.wl_registry_add_listener(registry, &clip_registry_listener, &d);
+    if (c.wl_display_roundtrip(display) == -1) return error.RoundtripFailed;
+
+    const manager = d.manager orelse return error.NoDataControlManager;
+    const seat = d.seat orelse return error.NoSeat;
+
+    d.db = try core.clipboard.open(allocator, io, environ);
+    defer d.db.close();
+
+    const device = c.zwlr_data_control_manager_v1_get_data_device(manager, seat) orelse return error.NoDataDevice;
+    _ = c.zwlr_data_control_device_v1_add_listener(device, &clip_device_listener, &d);
+
+    dbgDaemon(&d, "clipboard daemon: listening", .{});
+    while (true) {
+        if (c.wl_display_dispatch(display) == -1) return error.DispatchFailed;
+    }
+}
+
+const clip_registry_listener: c.wl_registry_listener = .{
+    .global = clipRegistryGlobal,
+    .global_remove = registryGlobalRemove,
+};
+
+fn clipRegistryGlobal(data: ?*anyopaque, registry: ?*c.wl_registry, name: u32, interface: [*c]const u8, version: u32) callconv(.c) void {
+    const d: *ClipboardDaemon = @ptrCast(@alignCast(data.?));
+    const iface = std.mem.span(interface);
+    dbgDaemon(d, "clipboard daemon: registryGlobal: {s} v{d}", .{ iface, version });
+
+    if (std.mem.eql(u8, iface, std.mem.span(c.wl_seat_interface.name))) {
+        d.seat = @ptrCast(@alignCast(c.wl_registry_bind(registry, name, &c.wl_seat_interface, @min(version, 7)).?));
+    } else if (std.mem.eql(u8, iface, std.mem.span(c.zwlr_data_control_manager_v1_interface.name))) {
+        d.manager = @ptrCast(@alignCast(c.wl_registry_bind(registry, name, &c.zwlr_data_control_manager_v1_interface, @min(version, 2)).?));
+    }
+}
+
+const clip_device_listener: c.zwlr_data_control_device_v1_listener = .{
+    .data_offer = clipDataOffer,
+    .selection = clipSelection,
+    .finished = clipDeviceFinished,
+    .primary_selection = clipPrimarySelection,
+};
+
+/// Accumulates one selection's advertised mime types (`offer` events)
+/// between the `data_offer` event that creates it and the `selection`
+/// event that says "this one's now current" -- see clipSelection.
+const OfferCtx = struct {
+    daemon: *ClipboardDaemon,
+    mime_types: std.ArrayList([]u8) = .empty,
+};
+
+fn clipDataOffer(data: ?*anyopaque, device: ?*c.zwlr_data_control_device_v1, id: ?*c.zwlr_data_control_offer_v1) callconv(.c) void {
+    _ = device;
+    const d: *ClipboardDaemon = @ptrCast(@alignCast(data.?));
+    const ctx = d.allocator.create(OfferCtx) catch return;
+    ctx.* = .{ .daemon = d };
+    _ = c.zwlr_data_control_offer_v1_add_listener(id, &clip_offer_listener, ctx);
+}
+
+const clip_offer_listener: c.zwlr_data_control_offer_v1_listener = .{ .offer = clipOfferMime };
+
+fn clipOfferMime(data: ?*anyopaque, offer: ?*c.zwlr_data_control_offer_v1, mime_type: [*c]const u8) callconv(.c) void {
+    _ = offer;
+    const ctx: *OfferCtx = @ptrCast(@alignCast(data.?));
+    const dup = ctx.daemon.allocator.dupe(u8, std.mem.span(mime_type)) catch return;
+    ctx.mime_types.append(ctx.daemon.allocator, dup) catch return;
+}
+
+fn clipSelection(data: ?*anyopaque, device: ?*c.zwlr_data_control_device_v1, id: ?*c.zwlr_data_control_offer_v1) callconv(.c) void {
+    _ = device;
+    const d: *ClipboardDaemon = @ptrCast(@alignCast(data.?));
+    const offer = id orelse return; // clipboard cleared, nothing to capture
+
+    const ctx: *OfferCtx = @ptrCast(@alignCast(c.wl_proxy_get_user_data(@ptrCast(offer))));
+    defer {
+        for (ctx.mime_types.items) |m| d.allocator.free(m);
+        ctx.mime_types.deinit(d.allocator);
+        d.allocator.destroy(ctx);
+        c.zwlr_data_control_offer_v1_destroy(offer);
+    }
+
+    const mime = pickMime(ctx.mime_types.items) orelse {
+        dbgDaemon(d, "clipboard daemon: no usable mime type offered, skipping", .{});
+        return;
+    };
+
+    const content = receiveOffer(d, offer, mime) catch |err| {
+        dbgDaemon(d, "clipboard daemon: receive failed: {t}", .{err});
+        return;
+    };
+    defer d.allocator.free(content);
+
+    core.clipboard.insert(d.allocator, d.db, mime, content) catch |err| {
+        dbgDaemon(d, "clipboard daemon: insert failed: {t}", .{err});
+    };
+}
+
+fn clipDeviceFinished(data: ?*anyopaque, device: ?*c.zwlr_data_control_device_v1) callconv(.c) void {
+    _ = .{ data, device };
+}
+
+fn clipPrimarySelection(data: ?*anyopaque, device: ?*c.zwlr_data_control_device_v1, id: ?*c.zwlr_data_control_offer_v1) callconv(.c) void {
+    _ = .{ data, device };
+    // Not tracked -- the primary selection (X11-style select-to-copy)
+    // fires far more often than deliberate copies and isn't history-worthy
+    // the way Ctrl+C/Ctrl+V is.
+    if (id) |offer| c.zwlr_data_control_offer_v1_destroy(offer);
+}
+
+/// Text first (any of the common encodings), then the image types the
+/// clipboard tab's preview knows how to size -- anything else (e.g. an
+/// offer that's only `text/uri-list`, common for file-manager copies) is
+/// deliberately skipped rather than stored as an opaque blob nothing could
+/// preview or usefully paste back.
+fn pickMime(mime_types: []const []const u8) ?[]const u8 {
+    const text_prefs = [_][]const u8{ "text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING" };
+    for (text_prefs) |want| {
+        for (mime_types) |m| if (std.mem.eql(u8, m, want)) return m;
+    }
+    const image_prefs = [_][]const u8{ "image/png", "image/jpeg" };
+    for (image_prefs) |want| {
+        for (mime_types) |m| if (std.mem.eql(u8, m, want)) return m;
+    }
+    return null;
+}
+
+/// Blocking: creates a pipe, asks the offer to write `mime`'s content into
+/// it, flushes so the source client sees the request, then reads to EOF.
+/// Simplest correct approach for a daemon that has nothing else to do
+/// while it waits -- see the section doc above for why this isn't folded
+/// into a poll loop the way the launcher's eventLoop is.
+fn receiveOffer(d: *ClipboardDaemon, offer: *c.zwlr_data_control_offer_v1, mime: []const u8) ![]u8 {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{})) != .SUCCESS) return error.PipeFailed;
+    const read_fd = fds[0];
+    const write_fd = fds[1];
+
+    const mime_z = try d.allocator.dupeZ(u8, mime);
+    defer d.allocator.free(mime_z);
+    c.zwlr_data_control_offer_v1_receive(offer, mime_z.ptr, write_fd);
+    _ = linux.close(write_fd);
+    _ = c.wl_display_flush(d.display);
+
+    defer _ = linux.close(read_fd);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(d.allocator);
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = posix.read(read_fd, &buf) catch break;
+        if (n == 0) break;
+        try out.appendSlice(d.allocator, buf[0..n]);
+    }
+    return out.toOwnedSlice(d.allocator);
 }

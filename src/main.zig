@@ -21,6 +21,16 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // Long-running background listener (meant to be started once, e.g. by
+    // a systemd --user unit -- see contrib/systemd/zofi-clipboard.service),
+    // not the interactive launcher: no singleton lock, no layer-shell
+    // surface, never returns on its own.
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--clipboard-daemon")) {
+        try wayland_backend.runClipboardDaemon(arena, io, environ, environ.get("ZOFI_DEBUG") != null);
+        return;
+    }
+
+
     var dmenu = false;
     var show: ?Show = null;
     var rank_harness = false;
@@ -54,8 +64,10 @@ pub fn main(init: std.process.Init) !void {
                 show = .run;
             } else if (std.mem.eql(u8, mode, "windows")) {
                 show = .windows;
+            } else if (std.mem.eql(u8, mode, "clipboard")) {
+                show = .clipboard;
             } else {
-                fatal("unknown -show mode '{s}' (expected drun, run or windows)", .{mode});
+                fatal("unknown -show mode '{s}' (expected drun, run, windows or clipboard)", .{mode});
             }
         } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--p")) {
             i += 1;
@@ -111,6 +123,7 @@ pub fn main(init: std.process.Init) !void {
             // once wlr-foreign-toplevel-management is bound, which
             // happens inside wayland_backend.run() itself.
             .windows => &.{},
+            .clipboard => try core.sources.clipboard.toEntries(arena, io, environ),
         };
         try runLauncher(arena, io, environ, entries, mode, terminal_cmd, debug, false);
         return;
@@ -151,6 +164,7 @@ fn printUsage(io: Io) !void {
         \\  zofi -show drun            Launch an application (.desktop entries)
         \\  zofi -show run             Launch a command from $PATH
         \\  zofi -show windows         Switch between open windows
+        \\  zofi -show clipboard       Pick from clipboard history, copy it back
         \\  zofi -dmenu                Pick a line from stdin, print it to stdout
         \\  echo -e "a\nb" | zofi -dmenu
         \\  zofi -h | --help | help    Show this message
@@ -164,6 +178,10 @@ fn printUsage(io: Io) !void {
         \\  ZOFI_DEBUG=1      Verbose logging to stderr
         \\  ZOFI_BROWSER=cmd  Browser used to open URL-shaped queries (default: firefox)
         \\  TERMINAL=cmd      Terminal used to launch terminal .desktop entries
+        \\
+        \\Clipboard history (-show clipboard) needs a background listener
+        \\running: zofi --clipboard-daemon, normally started once via
+        \\systemd --user (see contrib/systemd/zofi-clipboard.service).
         \\
     );
     try w.flush();
@@ -239,6 +257,11 @@ fn runLauncher(
             theme.active_tab = .windows;
             theme.placeholder = "Search windows";
         },
+        .clipboard => {
+            theme.compact_rows = true;
+            theme.active_tab = .clipboard;
+            theme.placeholder = "Search clipboard history";
+        },
     }
 
     const chosen = try wayland_backend.run(arena, io, theme, entries, .{
@@ -253,6 +276,15 @@ fn runLauncher(
     // the Wayland connection was still open -- there's nothing left to
     // shell out to here, and entry.action isn't even a command.
     if (mode == .windows) return;
+
+    // Doesn't run a command: `entry.action` is a "clipboard:<id>" marker
+    // (see `sources/clipboard.zig`), not something `core.launch.launch`
+    // could shell out to. Re-queries the DB for the real content and pipes
+    // it into `wl-copy` instead.
+    if (mode == .clipboard) {
+        try core.clipboard.copyToClipboard(arena, io, environ, entry.action orelse entry.label);
+        return;
+    }
 
     if (entry.is_url) {
         try core.launch.launchUrl(arena, io, environ, theme.browser_cmd, entry.action orelse entry.label);
