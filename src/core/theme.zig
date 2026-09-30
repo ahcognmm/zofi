@@ -48,7 +48,7 @@ pub const Theme = struct {
     dashboard_enabled: bool = false,
 
     // Panel
-    panel_width: f64 = 640,
+    panel_width: f64 = 840,
     panel_height: f64 = 516, // fixed, never jumps regardless of result count
     corner_radius: f64 = 14,
     border_width: f64 = 1,
