@@ -22,7 +22,7 @@ pub fn acquire(environ: *const std.process.Environ.Map) bool {
     const runtime_dir = environ.get("XDG_RUNTIME_DIR") orelse "/tmp";
     const path = std.fmt.bufPrintZ(&path_buf, "{s}/zofi.lock", .{runtime_dir}) catch return true;
 
-    const fd_raw = linux.open(path, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o600);
+    const fd_raw = linux.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
     if (linux.errno(fd_raw) != .SUCCESS) return true;
     const fd: i32 = @intCast(fd_raw);
 
