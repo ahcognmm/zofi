@@ -23,8 +23,27 @@ pub fn main(init: std.process.Init) !void {
     const environ = init.environ_map;
 
     const args = try init.minimal.args.toSlice(arena);
+
+    // Hidden: spawned detached by `core.weather.maybeRefresh` to do the
+    // actual network fetch off the interactive render path. Not a
+    // user-facing flag.
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--internal-refresh-weather")) {
+        core.weather.refreshNow(arena, io, environ);
+        return;
+    }
+
+    // Long-running background listener (meant to be started once, e.g. by
+    // a systemd --user unit or a launchd agent -- see contrib/), not the
+    // interactive launcher: no singleton lock, no window, never returns on
+    // its own.
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--clipboard-daemon")) {
+        try backend.runClipboardDaemon(arena, io, environ, environ.get("ZOFI_DEBUG") != null);
+        return;
+    }
+
     var dmenu = false;
     var show: ?Show = null;
+    var rank_harness = false;
     var query: []const u8 = "";
     var dmenu_prompt: ?[]const u8 = null;
     var display_columns: ?[]usize = null;
@@ -33,8 +52,18 @@ pub fn main(init: std.process.Init) !void {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "-dmenu") or std.mem.eql(u8, arg, "--dmenu")) {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "help")) {
+            try printUsage(io);
+            return;
+        } else if (std.mem.eql(u8, arg, "-dmenu") or std.mem.eql(u8, arg, "--dmenu")) {
             dmenu = true;
+        } else if (std.mem.eql(u8, arg, "--rank-harness")) {
+            // Internal dev tool (Phase 1 ranking tuning), not documented in
+            // --help: `echo -e "a\nb" | zofi --rank-harness query`. Must be
+            // explicit -- bare `zofi` always means "open the launcher",
+            // even when stdin isn't a tty (e.g. spawned by a compositor
+            // keybind, which typically isn't one either).
+            rank_harness = true;
         } else if (std.mem.eql(u8, arg, "-show") or std.mem.eql(u8, arg, "--show")) {
             i += 1;
             if (i >= args.len) fatal("-show requires an argument (drun or run)", .{});
@@ -45,8 +74,10 @@ pub fn main(init: std.process.Init) !void {
                 show = .run;
             } else if (std.mem.eql(u8, mode, "windows")) {
                 show = .windows;
+            } else if (std.mem.eql(u8, mode, "clipboard")) {
+                show = .clipboard;
             } else {
-                fatal("unknown -show mode '{s}' (expected drun, run or windows)", .{mode});
+                fatal("unknown -show mode '{s}' (expected drun, run, windows or clipboard)", .{mode});
             }
         } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--p")) {
             i += 1;
@@ -73,6 +104,15 @@ pub fn main(init: std.process.Init) !void {
 
     const debug = environ.get("ZOFI_DEBUG") != null;
 
+    // Every path opens a layer-shell surface except the headless rank
+    // harness, which has nothing to conflict with.
+    if (dmenu or show != null) {
+        if (!core.singleton.acquire(io, environ)) {
+            if (debug) std.debug.print("zofi: another instance is already running, exiting\n", .{});
+            return;
+        }
+    }
+
     if (dmenu) {
         var stdin_buffer: [64 * 1024]u8 = undefined;
         var stdin_reader = Io.File.Reader.init(.stdin(), io, &stdin_buffer);
@@ -87,24 +127,84 @@ pub fn main(init: std.process.Init) !void {
     if (show) |mode| {
         const terminal_cmd = environ.get("TERMINAL") orelse "xterm";
         const entries = switch (mode) {
-            .drun => if (is_macos)
-                try core.sources.macapps.scan(arena, io, environ)
-            else
-                try core.sources.desktop.scan(arena, io, environ, terminal_cmd),
+            .drun => try scanApps(arena, io, environ, terminal_cmd),
             .run => try core.sources.path.scan(arena, io, environ),
             // Nothing to scan up front: the backend builds the window list
             // itself inside run() (on Wayland it only exists once
             // wlr-foreign-toplevel-management is bound).
             .windows => &.{},
+            .clipboard => try core.sources.clipboard.toEntries(arena, io, environ),
         };
-        try runLauncher(arena, io, environ, entries, mode, terminal_cmd, debug);
+        try runLauncher(arena, io, environ, entries, mode, terminal_cmd, debug, false);
         return;
     }
 
-    var stdin_buffer: [64 * 1024]u8 = undefined;
-    var stdin_reader = Io.File.Reader.init(.stdin(), io, &stdin_buffer);
-    const entries = try core.sources.stdin.readEntries(arena, &stdin_reader.interface);
-    try runRankHarness(arena, io, entries, query);
+    if (rank_harness) {
+        var stdin_buffer: [64 * 1024]u8 = undefined;
+        var stdin_reader = Io.File.Reader.init(.stdin(), io, &stdin_buffer);
+        const entries = try core.sources.stdin.readEntries(arena, &stdin_reader.interface);
+        try runRankHarness(arena, io, entries, query);
+        return;
+    }
+
+    // No `-dmenu`/`-show`/`--rank-harness`: bare `zofi`, however it was
+    // launched (interactive terminal or a compositor keybind -- stdin
+    // typically isn't a tty either way). Open the default idle dashboard --
+    // the same app launcher as `-show drun`, but with the clock/calendar/
+    // recents view in place of the row list until you start typing.
+    if (!core.singleton.acquire(io, environ)) {
+        if (debug) std.debug.print("zofi: another instance is already running, exiting\n", .{});
+        return;
+    }
+    core.weather.maybeRefresh(arena, io, environ);
+    const terminal_cmd = environ.get("TERMINAL") orelse "xterm";
+    const entries = try scanApps(arena, io, environ, terminal_cmd);
+    try runLauncher(arena, io, environ, entries, .drun, terminal_cmd, debug, true);
+}
+
+/// The Apps tab's entries: `.app` bundles on macOS, `.desktop` files
+/// everywhere else.
+fn scanApps(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, terminal_cmd: []const u8) ![]core.state.Entry {
+    if (is_macos) return core.sources.macapps.scan(arena, io, environ);
+    return core.sources.desktop.scan(arena, io, environ, terminal_cmd);
+}
+
+fn printUsage(io: Io) !void {
+    var stdout_buffer: [4 * 1024]u8 = undefined;
+    var stdout_writer = Io.File.Writer.init(.stdout(), io, &stdout_buffer);
+    const w = &stdout_writer.interface;
+    try w.writeAll(
+        \\zofi - a rofi-style application launcher for Wayland/Hyprland and macOS
+        \\
+        \\Usage:
+        \\  zofi                       Default: app launcher with clock/calendar/recents
+        \\  zofi -show drun            Launch an application (.desktop entries, or
+        \\                             .app bundles on macOS)
+        \\  zofi -show run             Launch a command from $PATH
+        \\  zofi -show windows         Switch between open windows
+        \\  zofi -show clipboard       Pick from clipboard history, copy it back
+        \\  zofi -dmenu                Pick a line from stdin, print it to stdout
+        \\  echo -e "a\nb" | zofi -dmenu
+        \\  zofi -h | --help | help    Show this message
+        \\
+        \\dmenu options (rofi-compatible):
+        \\  -p TEXT                          Prompt label shown left of the input
+        \\  -display-columns N[,M...]        Show only these 1-indexed columns
+        \\  -display-column-separator SEP    Column separator (default: tab)
+        \\
+        \\Environment:
+        \\  ZOFI_DEBUG=1      Verbose logging to stderr
+        \\  ZOFI_BROWSER=cmd  Browser used to open URL-shaped queries (default: firefox;
+        \\                    on macOS, `open`, i.e. the default browser)
+        \\  TERMINAL=cmd      Terminal used to launch terminal .desktop entries
+        \\
+        \\Clipboard history (-show clipboard) needs a background listener
+        \\running: zofi --clipboard-daemon, normally started once via
+        \\systemd --user (see contrib/systemd/zofi-clipboard.service), or on
+        \\macOS a launchd agent (see contrib/launchd/).
+        \\
+    );
+    try w.flush();
 }
 
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
@@ -151,10 +251,12 @@ fn runLauncher(
     mode: Show,
     terminal_cmd: []const u8,
     debug: bool,
+    dashboard: bool,
 ) !void {
     var theme = try defaultTheme(arena, io);
     theme.show_tabs = true;
     theme.browser_cmd = environ.get("ZOFI_BROWSER") orelse default_browser;
+    theme.dashboard_enabled = dashboard;
     switch (mode) {
         .drun => {
             theme.compact_rows = false;
@@ -170,6 +272,15 @@ fn runLauncher(
             theme.compact_rows = false;
             theme.active_tab = .windows;
             theme.placeholder = "Search windows";
+        },
+        .clipboard => {
+            // Split-pane view (render.zig's drawClipboardSplit), not the
+            // compact single-line list -- see backend.zig's cycleMode for
+            // why compact_rows must match whatever row height that view
+            // actually uses.
+            theme.compact_rows = false;
+            theme.active_tab = .clipboard;
+            theme.placeholder = "Search clipboard history";
         },
     }
 
@@ -187,10 +298,21 @@ fn runLauncher(
     // command.
     if (mode == .windows) return;
 
+    // Doesn't run a command: `entry.action` is a "clipboard:<id>" marker
+    // (see `sources/clipboard.zig`), not something `core.launch.launch`
+    // could shell out to. Re-queries the DB for the real content and puts
+    // it back on the system clipboard instead (`wl-copy` on Wayland,
+    // NSPasteboard on macOS).
+    if (mode == .clipboard) {
+        try backend.copyToClipboard(arena, io, environ, entry.action orelse entry.label);
+        return;
+    }
+
     if (entry.is_url) {
         try core.launch.launchUrl(arena, io, environ, theme.browser_cmd, entry.action orelse entry.label);
         return;
     }
+    core.history.recordLaunch(arena, io, environ, entry);
     try core.launch.launch(arena, io, environ, entry.action orelse entry.label);
 }
 

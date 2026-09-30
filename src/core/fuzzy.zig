@@ -235,6 +235,7 @@ test "scoreWithPositions finds matched indices" {
     var positions: [3]usize = undefined;
     const s = try scoreWithPositions(&scratch, "fbr", "foo/bar", &positions);
     try std.testing.expect(s > SCORE_MIN);
+    // "foo/bar": f=0 o=1 o=2 /=3 b=4 a=5 r=6
     try std.testing.expectEqualSlices(usize, &.{ 0, 4, 6 }, &positions);
 }
 

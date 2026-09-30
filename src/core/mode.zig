@@ -4,20 +4,23 @@ pub const LauncherMode = enum {
     drun,
     run,
     windows,
+    clipboard,
 
     pub fn next(self: LauncherMode) LauncherMode {
         return switch (self) {
             .drun => .run,
             .run => .windows,
-            .windows => .drun,
+            .windows => .clipboard,
+            .clipboard => .drun,
         };
     }
 
     pub fn prev(self: LauncherMode) LauncherMode {
         return switch (self) {
-            .drun => .windows,
+            .drun => .clipboard,
             .run => .drun,
             .windows => .run,
+            .clipboard => .windows,
         };
     }
 };

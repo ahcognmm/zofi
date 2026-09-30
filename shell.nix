@@ -12,5 +12,6 @@ pkgs.mkShell {
     pkgs.wayland-protocols
     pkgs.wlr-protocols
     pkgs.libxkbcommon
+    pkgs.sqlite
   ];
 }

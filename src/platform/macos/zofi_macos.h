@@ -24,6 +24,8 @@ typedef enum {
     ZOFI_MAC_KEY_HOME,
     ZOFI_MAC_KEY_END,
     ZOFI_MAC_KEY_TAB,
+    /// Forward delete (Fn+Backspace on laptop keyboards).
+    ZOFI_MAC_KEY_DELETE,
 } ZofiMacNamedKey;
 
 typedef struct {
@@ -86,5 +88,24 @@ void zofi_mac_list_running_apps(void *ctx, ZofiMacAppVisitor visit);
 
 /// Brings every window of the app with this pid to the front.
 bool zofi_mac_activate_app(int32_t pid);
+
+/// Clipboard history (`zofi --clipboard-daemon` and the clipboard tab).
+/// NSPasteboard has no change notifications, only a counter that bumps on
+/// every write; the daemon polls it.
+int64_t zofi_mac_pasteboard_change_count(void);
+
+/// Reads the general pasteboard's current content and, if it's something
+/// the history keeps, calls `visit` once with a mime type
+/// ("text/plain;charset=utf-8" or "image/png"; TIFF-only images are
+/// converted to PNG) and the bytes, valid only during the call. Content
+/// marked concealed or transient (password managers, per nspasteboard.org)
+/// is skipped. Returns whether `visit` was called.
+typedef void (*ZofiMacPasteboardVisitor)(void *ctx, const char *mime, const void *bytes, size_t len);
+bool zofi_mac_pasteboard_read(void *ctx, ZofiMacPasteboardVisitor visit);
+
+/// Replaces the general pasteboard's content with `bytes` of type `mime`
+/// (any text/... type, or an image NSBitmapImageRep can decode). The data is
+/// handed to the pasteboard server, so it outlives this process.
+bool zofi_mac_pasteboard_write(const char *mime, const void *bytes, size_t len);
 
 #endif

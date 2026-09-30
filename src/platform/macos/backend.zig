@@ -58,6 +58,10 @@ const App = struct {
     /// there's no environ to search with (dmenu).
     icon_cache: ?core.icon.Cache = null,
 
+    /// Lazily-populated content/decode cache for the clipboard tab's
+    /// preview pane; only touched while `mode == .clipboard`.
+    clipboard_preview: core.clipboard.PreviewCache = .{},
+
     /// Frame buffer in device pixels (logical size x backing scale),
     /// reallocated whenever that pixel size changes.
     pixels: []z2d.pixel.ARGB = &.{},
@@ -140,7 +144,17 @@ fn present(app: *App) !void {
     // initBuffer clears to transparent, which is what's left showing
     // outside the panel's rounded corners.
     var surface = z2d.Surface.initBuffer(.image_surface_argb, null, app.pixels, w, h);
-    try core.render.render(app.io, app.allocator, &surface, &app.theme, &app.state, scale, if (app.icon_cache) |*cache| cache else null);
+    try core.render.render(
+        app.io,
+        app.allocator,
+        &surface,
+        &app.theme,
+        &app.state,
+        scale,
+        if (app.icon_cache) |*cache| cache else null,
+        app.environ,
+        &app.clipboard_preview,
+    );
     c.zofi_mac_window_present(window, app.pixels.ptr, w, h);
 }
 
@@ -173,6 +187,14 @@ fn handleKey(app: *App, ev: c.ZofiMacKeyEvent) !void {
         // A one-shot mode switch: letting a held Tab auto-repeat would spin
         // through every mode.
         if (!ev.repeat) try cycleMode(app, ev.shift);
+        return;
+    }
+
+    // Clipboard tab only: remove the selected history entry. Handled here,
+    // not by `state.handleKey`, since it needs the DB and an entry-list
+    // rebuild.
+    if (ev.named == c.ZOFI_MAC_KEY_DELETE and app.mode == .clipboard) {
+        try deleteSelectedClipboardEntry(app);
         return;
     }
 
@@ -267,26 +289,64 @@ fn cycleMode(app: *App, backward: bool) !void {
             return;
         },
         .windows => try buildWindowEntries(app),
+        .clipboard => core.sources.clipboard.toEntries(app.allocator, app.io, environ) catch |err| {
+            dbg(app, "cycleMode: clipboard scan failed: {t}", .{err});
+            return;
+        },
     };
     if (next_mode != .windows) app.window_pids = &.{};
 
     app.mode = next_mode;
+    // Clipboard's split view uses the tall row height too; `compact_rows`
+    // only feeds `visibleRows()` there.
     app.theme.compact_rows = next_mode == .run;
     app.theme.active_tab = switch (next_mode) {
         .drun => .apps,
         .run => .run,
         .windows => .windows,
+        .clipboard => .clipboard,
     };
     app.theme.placeholder = switch (next_mode) {
         .drun => "Search apps",
         .run => "Search commands",
         .windows => "Search windows",
+        .clipboard => "Search clipboard history",
     };
     // After the theme update: the page size depends on the row style.
     try replaceEntries(app, entries);
 
     try present(app);
     dbg(app, "cycleMode: switched to {t}, {d} entries", .{ next_mode, entries.len });
+}
+
+/// Deletes the selected clipboard-tab entry (forward delete) and rebuilds
+/// the list without switching modes.
+fn deleteSelectedClipboardEntry(app: *App) !void {
+    const entry = app.state.selectedEntry() orelse return;
+    const marker = entry.action orelse return;
+    const id = core.clipboard.parseMarker(marker) catch |err| {
+        dbg(app, "deleteSelectedClipboardEntry: bad marker {s}: {t}", .{ marker, err });
+        return;
+    };
+    const environ = app.environ orelse return;
+
+    var db = core.clipboard.open(app.allocator, app.io, environ) catch |err| {
+        dbg(app, "deleteSelectedClipboardEntry: open failed: {t}", .{err});
+        return;
+    };
+    defer db.close();
+    core.clipboard.deleteEntry(db, id) catch |err| {
+        dbg(app, "deleteSelectedClipboardEntry: delete failed: {t}", .{err});
+        return;
+    };
+    app.clipboard_preview.invalidate(id);
+
+    const entries = core.sources.clipboard.toEntries(app.allocator, app.io, environ) catch |err| {
+        dbg(app, "deleteSelectedClipboardEntry: rescan failed: {t}", .{err});
+        return;
+    };
+    try replaceEntries(app, entries);
+    try present(app);
 }
 
 fn activateSelectedApp(app: *App) void {
@@ -336,4 +396,72 @@ fn buildWindowEntries(app: *App) ![]core.state.Entry {
 
     app.window_pids = try list.pids.toOwnedSlice(app.allocator);
     return list.entries.toOwnedSlice(app.allocator);
+}
+
+/// Puts a clipboard-history entry (`"clipboard:<id>"` marker) back on the
+/// system clipboard via NSPasteboard. Counterpart of the Wayland backend's
+/// `copyToClipboard`, which pipes into `wl-copy`.
+pub fn copyToClipboard(allocator: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, marker: []const u8) !void {
+    const id = try core.clipboard.parseMarker(marker);
+    var db = try core.clipboard.open(allocator, io, environ);
+    defer db.close();
+    const content = try core.clipboard.fetchContent(allocator, db, id);
+
+    const mime_z = try allocator.dupeZ(u8, content.mime);
+    defer allocator.free(mime_z);
+    if (!c.zofi_mac_pasteboard_write(mime_z.ptr, content.bytes.ptr, content.bytes.len)) {
+        return error.PasteboardWriteFailed;
+    }
+}
+
+// ---------------------------------------------------------------------
+// Clipboard daemon: `zofi --clipboard-daemon`, normally run by a launchd
+// agent (see contrib/launchd/). macOS has no clipboard-change events, so
+// this polls NSPasteboard's change counter -- the same approach every
+// macOS clipboard manager takes.
+
+const poll_interval_ms = 500;
+
+const DaemonCtx = struct {
+    allocator: std.mem.Allocator,
+    db: core.clipboard.Db,
+    debug: bool,
+};
+
+pub fn runClipboardDaemon(allocator: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, debug: bool) !void {
+    var db = try core.clipboard.open(allocator, io, environ);
+    defer db.close();
+
+    // Per-change scratch memory, reset every time: this process runs for
+    // days, and `allocator` is main's never-freed arena.
+    var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch.deinit();
+
+    // -1 so whatever is on the clipboard at startup gets recorded too, as
+    // the Wayland daemon does when the compositor sends the current
+    // selection on bind.
+    var last_count: i64 = -1;
+    if (debug) std.debug.print("clipboard daemon: polling every {d}ms\n", .{poll_interval_ms});
+    while (true) {
+        const count = c.zofi_mac_pasteboard_change_count();
+        if (count != last_count) {
+            last_count = count;
+            _ = scratch.reset(.retain_capacity);
+            var ctx: DaemonCtx = .{ .allocator = scratch.allocator(), .db = db, .debug = debug };
+            if (!c.zofi_mac_pasteboard_read(&ctx, visitPasteboard) and debug) {
+                std.debug.print("clipboard daemon: change {d} has nothing to keep\n", .{count});
+            }
+        }
+        try Io.sleep(io, .fromMilliseconds(poll_interval_ms), .awake);
+    }
+}
+
+fn visitPasteboard(ctx_ptr: ?*anyopaque, mime: [*c]const u8, bytes: ?*const anyopaque, len: usize) callconv(.c) void {
+    const ctx: *DaemonCtx = @ptrCast(@alignCast(ctx_ptr.?));
+    const content: []const u8 = if (len > 0) @as([*]const u8, @ptrCast(bytes.?))[0..len] else "";
+    core.clipboard.insert(ctx.allocator, ctx.db, std.mem.span(mime), content) catch |err| {
+        if (ctx.debug) std.debug.print("clipboard daemon: insert failed: {t}\n", .{err});
+        return;
+    };
+    if (ctx.debug) std.debug.print("clipboard daemon: stored {d} bytes of {s}\n", .{ len, std.mem.span(mime) });
 }

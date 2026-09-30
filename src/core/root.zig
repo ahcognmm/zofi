@@ -8,16 +8,27 @@ pub const font = @import("font.zig");
 pub const icon = @import("icon.zig");
 pub const launch = @import("launch.zig");
 pub const mode = @import("mode.zig");
+pub const singleton = @import("singleton.zig");
+pub const dashboard = @import("dashboard.zig");
+pub const history = @import("history.zig");
+pub const weather = @import("weather.zig");
+pub const clipboard = @import("clipboard.zig");
+pub const ui = @import("ui/root.zig");
 
 pub const sources = struct {
     pub const stdin = @import("sources/stdin.zig");
     pub const desktop = @import("sources/desktop.zig");
     pub const macapps = @import("sources/macapps.zig");
     pub const path = @import("sources/path.zig");
+    pub const clipboard = @import("sources/clipboard.zig");
 };
 
-// Without a test block here, `zig build test` compiled none of these
-// files' tests at all.
+// `zig test`'s discovery only walks files reachable from *this* one via
+// `test` blocks, not merely `pub const` re-exports -- without this, e.g.
+// layout.zig's tests silently never run under `zig build test`, even
+// though render.zig genuinely imports and calls it (confirmed by
+// deliberately breaking an assertion in each and finding `zig build test`
+// still exited 0 until its module was referenced here).
 test {
     _ = fuzzy;
     _ = state;
@@ -27,8 +38,15 @@ test {
     _ = icon;
     _ = launch;
     _ = mode;
+    _ = singleton;
+    _ = dashboard;
+    _ = history;
+    _ = weather;
+    _ = clipboard;
+    _ = ui;
     _ = sources.stdin;
     _ = sources.desktop;
     _ = sources.macapps;
     _ = sources.path;
+    _ = sources.clipboard;
 }

@@ -16,6 +16,7 @@ enum {
     kZofiVKEscape = 0x35,
     kZofiVKKeypadEnter = 0x4C,
     kZofiVKHome = 0x73,
+    kZofiVKForwardDelete = 0x75,
     kZofiVKPageUp = 0x74,
     kZofiVKEnd = 0x77,
     kZofiVKPageDown = 0x79,
@@ -40,6 +41,7 @@ static ZofiMacNamedKey namedKeyFor(unsigned short keyCode) {
     case kZofiVKHome: return ZOFI_MAC_KEY_HOME;
     case kZofiVKEnd: return ZOFI_MAC_KEY_END;
     case kZofiVKTab: return ZOFI_MAC_KEY_TAB;
+    case kZofiVKForwardDelete: return ZOFI_MAC_KEY_DELETE;
     default: return ZOFI_MAC_KEY_NONE;
     }
 }
@@ -353,5 +355,70 @@ bool zofi_mac_activate_app(int32_t pid) {
             [NSApp yieldActivationToApplication:app];
         }
         return [app activateWithOptions:NSApplicationActivateAllWindows];
+    }
+}
+
+int64_t zofi_mac_pasteboard_change_count(void) {
+    return (int64_t)NSPasteboard.generalPasteboard.changeCount;
+}
+
+bool zofi_mac_pasteboard_read(void *ctx, ZofiMacPasteboardVisitor visit) {
+    @autoreleasepool {
+        NSPasteboard *pb = NSPasteboard.generalPasteboard;
+        NSArray<NSPasteboardType> *types = pb.types;
+        // nspasteboard.org conventions: password managers mark secrets as
+        // concealed, and apps mark throwaway content as transient.
+        if ([types containsObject:@"org.nspasteboard.ConcealedType"] ||
+            [types containsObject:@"org.nspasteboard.TransientType"]) {
+            return false;
+        }
+
+        // Text first, matching the Wayland daemon's preference order.
+        NSString *text = [pb stringForType:NSPasteboardTypeString];
+        if (text.length > 0) {
+            NSData *utf8 = [text dataUsingEncoding:NSUTF8StringEncoding];
+            visit(ctx, "text/plain;charset=utf-8", utf8.bytes, utf8.length);
+            return true;
+        }
+
+        NSData *png = [pb dataForType:NSPasteboardTypePNG];
+        if (png.length == 0) {
+            // Screenshots and most image copies on macOS are TIFF-only.
+            NSData *tiff = [pb dataForType:NSPasteboardTypeTIFF];
+            if (tiff.length > 0) {
+                NSBitmapImageRep *rep = [NSBitmapImageRep imageRepWithData:tiff];
+                png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+            }
+        }
+        if (png.length > 0) {
+            visit(ctx, "image/png", png.bytes, png.length);
+            return true;
+        }
+        return false;
+    }
+}
+
+bool zofi_mac_pasteboard_write(const char *mime, const void *bytes, size_t len) {
+    @autoreleasepool {
+        NSPasteboard *pb = NSPasteboard.generalPasteboard;
+        NSData *data = [NSData dataWithBytes:bytes length:len];
+
+        if (strncmp(mime, "text/", 5) == 0) {
+            NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (!text) return false;
+            [pb clearContents];
+            return [pb setString:text forType:NSPasteboardTypeString];
+        }
+
+        // Offer both PNG and TIFF: some apps only paste one or the other.
+        NSBitmapImageRep *rep = [NSBitmapImageRep imageRepWithData:data];
+        if (!rep) return false;
+        NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+        NSData *tiff = rep.TIFFRepresentation;
+        [pb declareTypes:@[ NSPasteboardTypePNG, NSPasteboardTypeTIFF ] owner:nil];
+        BOOL ok = NO;
+        if (png) ok = [pb setData:png forType:NSPasteboardTypePNG] || ok;
+        if (tiff) ok = [pb setData:tiff forType:NSPasteboardTypeTIFF] || ok;
+        return ok;
     }
 }
