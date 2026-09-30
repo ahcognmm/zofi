@@ -25,7 +25,17 @@ pub const MatchedLabel = struct {
         var label = self.text;
         var truncated = false;
         if (max_chars > 1 and label.len > max_chars) {
-            label = label[0 .. max_chars - 1];
+            // Byte length vs. character budget: walk codepoints rather than
+            // slicing at a raw byte offset, which can land mid-sequence and
+            // hand `showText` a truncated multi-byte tail (z2d's
+            // `InvalidSequence`) whenever `label` has non-ASCII text -- a
+            // window title, say.
+            var end: usize = 0;
+            var count: usize = 0;
+            while (end < label.len and count < max_chars - 1) : (count += 1) {
+                end += std.unicode.utf8ByteSequenceLength(label[end]) catch 1;
+            }
+            label = label[0..end];
             truncated = true;
         }
 

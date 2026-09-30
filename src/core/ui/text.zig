@@ -43,7 +43,17 @@ pub const Label = struct {
         if (char_w <= 0) return self.draw(ctx, rect);
         const max_chars: usize = @intFromFloat(@max(0.0, rect.w / char_w));
         var clipped = self;
-        clipped.text = if (self.text.len > max_chars) self.text[0..max_chars] else self.text;
+        if (self.text.len > max_chars) {
+            // Walk codepoints rather than slicing at a raw byte offset --
+            // see matched_text.zig's `draw` for why (non-ASCII text can
+            // otherwise get cut mid-sequence).
+            var end: usize = 0;
+            var count: usize = 0;
+            while (end < self.text.len and count < max_chars) : (count += 1) {
+                end += std.unicode.utf8ByteSequenceLength(self.text[end]) catch 1;
+            }
+            clipped.text = self.text[0..end];
+        }
         try clipped.draw(ctx, rect);
     }
 };

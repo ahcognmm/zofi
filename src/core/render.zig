@@ -957,8 +957,16 @@ fn clipCentered(label: Label, avail_w: f64) Label {
     const char_w = Theme.charWidth(label.font_size);
     const max_chars: usize = if (char_w > 0) @intFromFloat(@max(0.0, avail_w / char_w)) else 0;
     if (max_chars > 1 and label.text.len > max_chars) {
+        // Walk codepoints rather than slicing at a raw byte offset -- see
+        // matched_text.zig's `draw` for why (non-ASCII text can otherwise
+        // get cut mid-sequence and crash z2d's `showText`).
+        var end: usize = 0;
+        var count: usize = 0;
+        while (end < label.text.len and count < max_chars - 1) : (count += 1) {
+            end += std.unicode.utf8ByteSequenceLength(label.text[end]) catch 1;
+        }
         var clipped = label;
-        clipped.text = label.text[0 .. max_chars - 1];
+        clipped.text = label.text[0..end];
         return clipped;
     }
     return label;
