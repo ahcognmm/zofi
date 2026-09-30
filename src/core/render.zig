@@ -537,9 +537,11 @@ fn drawClipboardMeta(
 
     var buf1: [64]u8 = undefined;
     var buf2: [64]u8 = undefined;
+    var buf3: [32]u8 = undefined;
+    const copies = std.fmt.bufPrint(&buf3, "{d}", .{preview.copy_count}) catch "";
 
     const Row = struct { dt: []const u8, dd: []const u8 };
-    var rows: [4]Row = undefined;
+    var rows: [5]Row = undefined;
     var n: usize = 0;
 
     switch (preview.kind) {
@@ -548,7 +550,8 @@ fn drawClipboardMeta(
             rows[1] = .{ .dt = "Size", .dd = std.fmt.bufPrint(&buf1, "{d} x {d} px", .{ preview.img_width, preview.img_height }) catch "" };
             rows[2] = .{ .dt = "File", .dd = std.fmt.bufPrint(&buf2, "{d} KB", .{@divTrunc(preview.size_bytes, 1024)}) catch "" };
             rows[3] = .{ .dt = "Copied", .dd = age };
-            n = 4;
+            rows[4] = .{ .dt = "Copies", .dd = copies };
+            n = 5;
         },
         .color => {
             const trimmed = std.mem.trim(u8, preview.text, " \t\r\n");
@@ -558,21 +561,24 @@ fn drawClipboardMeta(
             rows[1] = .{ .dt = "RGB", .dd = std.fmt.bufPrint(&buf1, "{d}, {d}, {d}", .{ rgb.r, rgb.g, rgb.b }) catch "" };
             rows[2] = .{ .dt = "HSL", .dd = std.fmt.bufPrint(&buf2, "{d:.0}\xC2\xB0, {d:.0}%, {d:.0}%", .{ hsl.h, hsl.s * 100, hsl.l * 100 }) catch "" };
             rows[3] = .{ .dt = "Copied", .dd = age };
-            n = 4;
+            rows[4] = .{ .dt = "Copies", .dd = copies };
+            n = 5;
         },
         .link => {
             const trimmed = std.mem.trim(u8, preview.text, " \t\r\n");
             rows[0] = .{ .dt = "Domain", .dd = clipboard_mod.urlDomain(trimmed) };
             rows[1] = .{ .dt = "Characters", .dd = std.fmt.bufPrint(&buf1, "{d}", .{preview.text.len}) catch "" };
             rows[2] = .{ .dt = "Copied", .dd = age };
-            n = 3;
+            rows[3] = .{ .dt = "Copies", .dd = copies };
+            n = 4;
         },
         .text => {
             const lines = std.mem.count(u8, preview.text, "\n") + 1;
             rows[0] = .{ .dt = "Characters", .dd = std.fmt.bufPrint(&buf1, "{d}", .{preview.text.len}) catch "" };
             rows[1] = .{ .dt = "Lines", .dd = std.fmt.bufPrint(&buf2, "{d}", .{lines}) catch "" };
             rows[2] = .{ .dt = "Copied", .dd = age };
-            n = 3;
+            rows[3] = .{ .dt = "Copies", .dd = copies };
+            n = 4;
         },
     }
 

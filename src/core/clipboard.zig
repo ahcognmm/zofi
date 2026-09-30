@@ -36,6 +36,7 @@ pub const Content = struct {
     bytes: []const u8,
     size: i64,
     created_at: i64,
+    copy_count: i64,
 };
 
 fn cacheDir(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
@@ -54,10 +55,14 @@ const schema =
     \\  size INTEGER NOT NULL,
     \\  created_at INTEGER NOT NULL
     \\);
+    \\CREATE INDEX IF NOT EXISTS entries_hash ON entries(hash);
 ;
 
 fn ensureSchema(db: Db) !void {
     if (c.sqlite3_exec(db.handle, schema, null, null, null) != c.SQLITE_OK) return error.SqliteSchemaFailed;
+    // Added after the initial release -- ignore the failure on a db that
+    // already has this column (sqlite3 has no "ADD COLUMN IF NOT EXISTS").
+    _ = c.sqlite3_exec(db.handle, "ALTER TABLE entries ADD COLUMN copy_count INTEGER NOT NULL DEFAULT 1", null, null, null);
 }
 
 /// Opens (creating if needed) the sqlite file at the exact given `path` and
@@ -87,44 +92,58 @@ pub fn open(allocator: std.mem.Allocator, io: Io, environ: *const std.process.En
     return openAt(allocator, io, path);
 }
 
-fn lastHash(db: Db) !?[20]u8 {
+/// Id of any existing entry with this exact content hash, anywhere in
+/// history (not just the most recent row).
+fn findByHash(db: Db, hash: [20]u8) !?i64 {
     var stmt: ?*c.sqlite3_stmt = null;
-    const sql = "SELECT hash FROM entries ORDER BY id DESC LIMIT 1";
+    const sql = "SELECT id FROM entries WHERE hash = ? LIMIT 1";
     if (c.sqlite3_prepare_v2(db.handle, sql, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
     defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_blob(stmt, 1, &hash, hash.len, null);
 
     if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
-    const blob = c.sqlite3_column_blob(stmt, 0);
-    const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
-    if (len != 20 or blob == null) return null;
-
-    var out: [20]u8 = undefined;
-    @memcpy(&out, @as([*]const u8, @ptrCast(blob.?))[0..20]);
-    return out;
+    return c.sqlite3_column_int64(stmt, 0);
 }
 
-/// Inserts `content` under `mime`, unless it's byte-identical to the most
-/// recently inserted entry -- both ordinary apps re-setting the same
-/// selection redundantly, and the no-op of re-copying the current newest
-/// history entry back onto the clipboard from the clipboard tab, would
-/// otherwise spam consecutive duplicates. Building the preview (including
-/// decoding image dimensions) happens here so the daemon and any other
-/// writer never have to duplicate that logic.
+fn touchExisting(db: Db, id: i64, now: i64) !void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql = "UPDATE entries SET created_at = ?, copy_count = copy_count + 1 WHERE id = ?";
+    if (c.sqlite3_prepare_v2(db.handle, sql, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_int64(stmt, 1, now);
+    _ = c.sqlite3_bind_int64(stmt, 2, id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.SqliteUpdateFailed;
+}
+
+/// Records a clipboard write. If `content` matches an entry already in
+/// history (anywhere, not just the most recent one) -- either a genuine
+/// repeat copy or the no-op of re-copying a history entry back onto the
+/// clipboard from the clipboard tab -- bumps that entry's `copy_count` and
+/// moves it to the top (`created_at = now`) instead of inserting a
+/// duplicate row. Building the preview (including decoding image
+/// dimensions) happens here so the daemon and any other writer never have
+/// to duplicate that logic.
 pub fn insert(allocator: std.mem.Allocator, db: Db, mime: []const u8, content: []const u8) !void {
     if (content.len == 0) return;
 
     var hash: [20]u8 = undefined;
     std.crypto.hash.Sha1.hash(content, &hash, .{});
 
-    if (try lastHash(db)) |last| {
-        if (std.mem.eql(u8, &last, &hash)) return;
+    const time_c = @cImport({
+        @cInclude("time.h");
+    });
+    const now: i64 = @intCast(time_c.time(null));
+
+    if (try findByHash(db, hash)) |existing_id| {
+        try touchExisting(db, existing_id, now);
+        return;
     }
 
     const preview = try buildPreview(allocator, mime, content);
     defer allocator.free(preview);
 
     var stmt: ?*c.sqlite3_stmt = null;
-    const sql = "INSERT INTO entries (mime, hash, content, preview, size, created_at) VALUES (?, ?, ?, ?, ?, ?)";
+    const sql = "INSERT INTO entries (mime, hash, content, preview, size, created_at, copy_count) VALUES (?, ?, ?, ?, ?, ?, 1)";
     if (c.sqlite3_prepare_v2(db.handle, sql, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
     defer _ = c.sqlite3_finalize(stmt);
 
@@ -136,10 +155,7 @@ pub fn insert(allocator: std.mem.Allocator, db: Db, mime: []const u8, content: [
     _ = c.sqlite3_bind_blob(stmt, 3, content.ptr, @intCast(content.len), null);
     _ = c.sqlite3_bind_text(stmt, 4, preview.ptr, @intCast(preview.len), null);
     _ = c.sqlite3_bind_int64(stmt, 5, @intCast(content.len));
-    const time_c = @cImport({
-        @cInclude("time.h");
-    });
-    _ = c.sqlite3_bind_int64(stmt, 6, @intCast(time_c.time(null)));
+    _ = c.sqlite3_bind_int64(stmt, 6, now);
 
     if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.SqliteInsertFailed;
 
@@ -190,10 +206,12 @@ fn enforceCap(db: Db) !void {
     }
 }
 
-/// Newest first, for the clipboard tab's row list.
+/// Newest first, for the clipboard tab's row list. Ordered by `created_at`,
+/// not `id` -- a re-copy of an existing entry (see `insert`) bumps
+/// `created_at` without changing `id`, and should resurface at the top.
 pub fn list(allocator: std.mem.Allocator, db: Db) ![]Row {
     var stmt: ?*c.sqlite3_stmt = null;
-    const sql = "SELECT id, preview FROM entries ORDER BY id DESC";
+    const sql = "SELECT id, preview FROM entries ORDER BY created_at DESC, id DESC";
     if (c.sqlite3_prepare_v2(db.handle, sql, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
     defer _ = c.sqlite3_finalize(stmt);
 
@@ -214,7 +232,7 @@ pub fn list(allocator: std.mem.Allocator, db: Db) ![]Row {
 /// loads the (potentially large, e.g. image) blob column.
 pub fn fetchContent(allocator: std.mem.Allocator, db: Db, id: i64) !Content {
     var stmt: ?*c.sqlite3_stmt = null;
-    const sql = "SELECT mime, content, size, created_at FROM entries WHERE id = ?";
+    const sql = "SELECT mime, content, size, created_at, copy_count FROM entries WHERE id = ?";
     if (c.sqlite3_prepare_v2(db.handle, sql, -1, &stmt, null) != c.SQLITE_OK) return error.SqlitePrepareFailed;
     defer _ = c.sqlite3_finalize(stmt);
     _ = c.sqlite3_bind_int64(stmt, 1, id);
@@ -231,8 +249,9 @@ pub fn fetchContent(allocator: std.mem.Allocator, db: Db, id: i64) !Content {
 
     const size = c.sqlite3_column_int64(stmt, 2);
     const created_at = c.sqlite3_column_int64(stmt, 3);
+    const copy_count = c.sqlite3_column_int64(stmt, 4);
 
-    return .{ .mime = mime, .bytes = bytes, .size = size, .created_at = created_at };
+    return .{ .mime = mime, .bytes = bytes, .size = size, .created_at = created_at, .copy_count = copy_count };
 }
 
 /// Deletes one entry (the clipboard tab's Del key). No-op (not an error)
@@ -410,6 +429,7 @@ pub const Preview = struct {
     text: []const u8,
     size_bytes: i64,
     created_at: i64,
+    copy_count: i64,
     img_width: u32 = 0,
     img_height: u32 = 0,
     /// Decoded pixels for `kind == .image`, ready for `ui.image.Image` to
@@ -433,6 +453,7 @@ pub fn loadPreview(allocator: std.mem.Allocator, db: Db, id: i64) !Preview {
         .text = if (kind == .image) &[_]u8{} else content.bytes,
         .size_bytes = content.size,
         .created_at = content.created_at,
+        .copy_count = content.copy_count,
     };
 
     if (kind == .image) decode: {
