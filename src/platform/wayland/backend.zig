@@ -704,9 +704,13 @@ fn processKeycode(app: *App, wayland_keycode: u32) !void {
 
     const ctrl_active = c.xkb_state_mod_name_is_active(st, c.XKB_MOD_NAME_CTRL, c.XKB_STATE_MODS_EFFECTIVE) == 1;
 
-    if (sym == c.XKB_KEY_Tab and app.mode != null) {
+    // Shift+Tab doesn't reliably show up as Tab-plus-modifier: many xkb
+    // layouts remap it to the distinct ISO_Left_Tab keysym instead (a
+    // long-standing X11/XKB convention), so relying on the shift modifier
+    // alone misses it entirely.
+    if ((sym == c.XKB_KEY_Tab or sym == c.XKB_KEY_ISO_Left_Tab) and app.mode != null) {
         const shift_active = c.xkb_state_mod_name_is_active(st, c.XKB_MOD_NAME_SHIFT, c.XKB_STATE_MODS_EFFECTIVE) == 1;
-        try cycleMode(app, shift_active);
+        try cycleMode(app, shift_active or sym == c.XKB_KEY_ISO_Left_Tab);
         return;
     }
 
