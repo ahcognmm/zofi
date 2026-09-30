@@ -44,7 +44,9 @@ pub fn build(b: *std.Build) void {
     // clipboard tab's entry source, lives in core -- needs its own
     // link/include setup since each Zig module resolves @cImport
     // separately (addWaylandBackend below only covers the exe module).
-    addPkgConfigIncludes(b, core_mod, &.{"sqlite3"});
+    // On macOS, sqlite3's header and library come with the SDK (and
+    // pkg-config usually isn't installed at all).
+    if (target.result.os.tag != .macos) addPkgConfigIncludes(b, core_mod, &.{"sqlite3"});
     core_mod.linkSystemLibrary("sqlite3", .{});
 
     const exe = b.addExecutable(.{
@@ -60,7 +62,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    addWaylandBackend(b, exe.root_module, target, optimize);
+    // Must agree with the backend main.zig picks for the same target.
+    if (target.result.os.tag == .macos) {
+        addMacosBackend(b, exe.root_module);
+    } else {
+        addWaylandBackend(b, exe.root_module, target, optimize);
+    }
 
     b.installArtifact(exe);
 
@@ -141,6 +148,25 @@ fn addWaylandBackend(
     mod.addIncludePath(data_control.header.dirname());
 
     _ = target;
+}
+
+/// Compiles the AppKit glue (Objective-C, ARC) and links the system
+/// frameworks it uses. Nothing to install beyond Zig itself and Xcode or
+/// the Command Line Tools (`xcode-select --install`), which provide the
+/// macOS SDK that Zig picks up automatically for native builds.
+fn addMacosBackend(b: *std.Build, mod: *std.Build.Module) void {
+    mod.link_libc = true;
+    mod.addIncludePath(b.path("src/platform/macos"));
+    mod.addCSourceFile(.{
+        .file = b.path("src/platform/macos/window.m"),
+        .flags = &.{ "-fobjc-arc", "-Wall", "-Wextra" },
+    });
+    mod.linkFramework("AppKit", .{});
+    mod.linkFramework("QuartzCore", .{});
+    mod.linkFramework("CoreGraphics", .{});
+    mod.linkFramework("Foundation", .{});
+    mod.linkFramework("CoreFoundation", .{});
+    mod.linkSystemLibrary("objc", .{});
 }
 
 const ScannedProtocol = struct {

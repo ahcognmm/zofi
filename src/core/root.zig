@@ -7,6 +7,7 @@ pub const render = @import("render.zig");
 pub const font = @import("font.zig");
 pub const icon = @import("icon.zig");
 pub const launch = @import("launch.zig");
+pub const mode = @import("mode.zig");
 pub const singleton = @import("singleton.zig");
 pub const dashboard = @import("dashboard.zig");
 pub const history = @import("history.zig");
@@ -17,6 +18,7 @@ pub const ui = @import("ui/root.zig");
 pub const sources = struct {
     pub const stdin = @import("sources/stdin.zig");
     pub const desktop = @import("sources/desktop.zig");
+    pub const macapps = @import("sources/macapps.zig");
     pub const path = @import("sources/path.zig");
     pub const clipboard = @import("sources/clipboard.zig");
 };
@@ -35,6 +37,7 @@ test {
     _ = font;
     _ = icon;
     _ = launch;
+    _ = mode;
     _ = singleton;
     _ = dashboard;
     _ = history;
@@ -43,6 +46,7 @@ test {
     _ = ui;
     _ = sources.stdin;
     _ = sources.desktop;
+    _ = sources.macapps;
     _ = sources.path;
     _ = sources.clipboard;
 }

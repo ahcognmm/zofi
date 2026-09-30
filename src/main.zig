@@ -1,10 +1,21 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 const core = @import("core");
-const wayland_backend = @import("platform/wayland/backend.zig");
 
-const Show = wayland_backend.LauncherMode;
+const is_macos = builtin.os.tag == .macos;
+/// AppKit on macOS, Wayland everywhere else. Both expose the same `run`.
+const backend = if (is_macos)
+    @import("platform/macos/backend.zig")
+else
+    @import("platform/wayland/backend.zig");
+
+const Show = core.mode.LauncherMode;
+
+/// What a URL-shaped query gets handed to unless `$ZOFI_BROWSER` says
+/// otherwise. macOS's `open` goes to the user's default browser.
+const default_browser = if (is_macos) "open" else "firefox";
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -22,14 +33,13 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Long-running background listener (meant to be started once, e.g. by
-    // a systemd --user unit -- see contrib/systemd/zofi-clipboard.service),
-    // not the interactive launcher: no singleton lock, no layer-shell
-    // surface, never returns on its own.
+    // a systemd --user unit or a launchd agent -- see contrib/), not the
+    // interactive launcher: no singleton lock, no window, never returns on
+    // its own.
     if (args.len > 1 and std.mem.eql(u8, args[1], "--clipboard-daemon")) {
-        try wayland_backend.runClipboardDaemon(arena, io, environ, environ.get("ZOFI_DEBUG") != null);
+        try backend.runClipboardDaemon(arena, io, environ, environ.get("ZOFI_DEBUG") != null);
         return;
     }
-
 
     var dmenu = false;
     var show: ?Show = null;
@@ -97,7 +107,7 @@ pub fn main(init: std.process.Init) !void {
     // Every path opens a layer-shell surface except the headless rank
     // harness, which has nothing to conflict with.
     if (dmenu or show != null) {
-        if (!core.singleton.acquire(environ)) {
+        if (!core.singleton.acquire(io, environ)) {
             if (debug) std.debug.print("zofi: another instance is already running, exiting\n", .{});
             return;
         }
@@ -117,11 +127,11 @@ pub fn main(init: std.process.Init) !void {
     if (show) |mode| {
         const terminal_cmd = environ.get("TERMINAL") orelse "xterm";
         const entries = switch (mode) {
-            .drun => try core.sources.desktop.scan(arena, io, environ, terminal_cmd),
+            .drun => try scanApps(arena, io, environ, terminal_cmd),
             .run => try core.sources.path.scan(arena, io, environ),
-            // Nothing to scan up front: the live window list only exists
-            // once wlr-foreign-toplevel-management is bound, which
-            // happens inside wayland_backend.run() itself.
+            // Nothing to scan up front: the backend builds the window list
+            // itself inside run() (on Wayland it only exists once
+            // wlr-foreign-toplevel-management is bound).
             .windows => &.{},
             .clipboard => try core.sources.clipboard.toEntries(arena, io, environ),
         };
@@ -142,14 +152,21 @@ pub fn main(init: std.process.Init) !void {
     // typically isn't a tty either way). Open the default idle dashboard --
     // the same app launcher as `-show drun`, but with the clock/calendar/
     // recents view in place of the row list until you start typing.
-    if (!core.singleton.acquire(environ)) {
+    if (!core.singleton.acquire(io, environ)) {
         if (debug) std.debug.print("zofi: another instance is already running, exiting\n", .{});
         return;
     }
     core.weather.maybeRefresh(arena, io, environ);
     const terminal_cmd = environ.get("TERMINAL") orelse "xterm";
-    const entries = try core.sources.desktop.scan(arena, io, environ, terminal_cmd);
+    const entries = try scanApps(arena, io, environ, terminal_cmd);
     try runLauncher(arena, io, environ, entries, .drun, terminal_cmd, debug, true);
+}
+
+/// The Apps tab's entries: `.app` bundles on macOS, `.desktop` files
+/// everywhere else.
+fn scanApps(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, terminal_cmd: []const u8) ![]core.state.Entry {
+    if (is_macos) return core.sources.macapps.scan(arena, io, environ);
+    return core.sources.desktop.scan(arena, io, environ, terminal_cmd);
 }
 
 fn printUsage(io: Io) !void {
@@ -157,11 +174,12 @@ fn printUsage(io: Io) !void {
     var stdout_writer = Io.File.Writer.init(.stdout(), io, &stdout_buffer);
     const w = &stdout_writer.interface;
     try w.writeAll(
-        \\zofi - a rofi-style application launcher for Wayland/Hyprland
+        \\zofi - a rofi-style application launcher for Wayland/Hyprland and macOS
         \\
         \\Usage:
         \\  zofi                       Default: app launcher with clock/calendar/recents
-        \\  zofi -show drun            Launch an application (.desktop entries)
+        \\  zofi -show drun            Launch an application (.desktop entries, or
+        \\                             .app bundles on macOS)
         \\  zofi -show run             Launch a command from $PATH
         \\  zofi -show windows         Switch between open windows
         \\  zofi -show clipboard       Pick from clipboard history, copy it back
@@ -176,12 +194,14 @@ fn printUsage(io: Io) !void {
         \\
         \\Environment:
         \\  ZOFI_DEBUG=1      Verbose logging to stderr
-        \\  ZOFI_BROWSER=cmd  Browser used to open URL-shaped queries (default: firefox)
+        \\  ZOFI_BROWSER=cmd  Browser used to open URL-shaped queries (default: firefox;
+        \\                    on macOS, `open`, i.e. the default browser)
         \\  TERMINAL=cmd      Terminal used to launch terminal .desktop entries
         \\
         \\Clipboard history (-show clipboard) needs a background listener
         \\running: zofi --clipboard-daemon, normally started once via
-        \\systemd --user (see contrib/systemd/zofi-clipboard.service).
+        \\systemd --user (see contrib/systemd/zofi-clipboard.service), or on
+        \\macOS a launchd agent (see contrib/launchd/).
         \\
     );
     try w.flush();
@@ -197,11 +217,7 @@ fn defaultTheme(arena: std.mem.Allocator, io: Io) !core.theme.Theme {
     // A monospace font makes approxCharWidth's per-char advance estimate
     // (theme.zig) exact instead of approximate, which is what keeps the
     // cursor, truncation and query-viewport scrolling pixel-accurate.
-    theme.font_path = (try core.font.fcMatch(arena, io, "monospace")) orelse
-        (try core.font.find(arena, io, &.{ "DejaVuSansMono", "Mono", "Consolas", "Menlo" })) orelse
-        (try core.font.find(arena, io, &.{ "DejaVuSans", "Inter", "Noto", "Liberation" })) orelse
-        (try core.font.fcMatch(arena, io, "sans-serif")) orelse
-        (try core.font.findAny(arena, io));
+    theme.font_path = try core.font.findDefault(arena, io);
     return theme;
 }
 
@@ -215,7 +231,7 @@ fn runDmenu(arena: std.mem.Allocator, io: Io, entries: []const core.state.Entry,
     theme.placeholder = "Filter";
     theme.dmenu_prompt = prompt;
 
-    const chosen = try wayland_backend.run(arena, io, theme, entries, .{ .debug = debug });
+    const chosen = try backend.run(arena, io, theme, entries, .{ .debug = debug });
     const entry = chosen orelse std.process.exit(1);
 
     var stdout_buffer: [4 * 1024]u8 = undefined;
@@ -239,7 +255,7 @@ fn runLauncher(
 ) !void {
     var theme = try defaultTheme(arena, io);
     theme.show_tabs = true;
-    theme.browser_cmd = environ.get("ZOFI_BROWSER") orelse "firefox";
+    theme.browser_cmd = environ.get("ZOFI_BROWSER") orelse default_browser;
     theme.dashboard_enabled = dashboard;
     switch (mode) {
         .drun => {
@@ -268,7 +284,7 @@ fn runLauncher(
         },
     }
 
-    const chosen = try wayland_backend.run(arena, io, theme, entries, .{
+    const chosen = try backend.run(arena, io, theme, entries, .{
         .debug = debug,
         .mode = mode,
         .environ = environ,
@@ -277,16 +293,18 @@ fn runLauncher(
     const entry = chosen orelse std.process.exit(1);
 
     // Windows mode already focused the window itself, inside run(), while
-    // the Wayland connection was still open -- there's nothing left to
-    // shell out to here, and entry.action isn't even a command.
+    // the Wayland connection (or AppKit session) was still open -- there's
+    // nothing left to shell out to here, and entry.action isn't even a
+    // command.
     if (mode == .windows) return;
 
     // Doesn't run a command: `entry.action` is a "clipboard:<id>" marker
     // (see `sources/clipboard.zig`), not something `core.launch.launch`
-    // could shell out to. Re-queries the DB for the real content and pipes
-    // it into `wl-copy` instead.
+    // could shell out to. Re-queries the DB for the real content and puts
+    // it back on the system clipboard instead (`wl-copy` on Wayland,
+    // NSPasteboard on macOS).
     if (mode == .clipboard) {
-        try core.clipboard.copyToClipboard(arena, io, environ, entry.action orelse entry.label);
+        try backend.copyToClipboard(arena, io, environ, entry.action orelse entry.label);
         return;
     }
 
@@ -317,5 +335,5 @@ fn runRankHarness(arena: std.mem.Allocator, io: Io, entries: []const core.state.
 }
 
 test {
-    _ = wayland_backend;
+    _ = backend;
 }

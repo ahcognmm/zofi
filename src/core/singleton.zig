@@ -3,10 +3,7 @@
 //! surface painted) would otherwise stack a second layer-shell surface on
 //! top of the first with no way to tell them apart.
 const std = @import("std");
-const linux = std.os.linux;
-
-const LOCK_EX: i32 = 2;
-const LOCK_NB: i32 = 4;
+const Io = std.Io;
 
 /// Tries to become the one running instance. Returns `true` if this
 /// process holds the lock (no other instance is running, or the lock
@@ -14,18 +11,37 @@ const LOCK_NB: i32 = 4;
 /// over a `/tmp` permissions quirk). Returns `false` if another instance
 /// already holds it.
 ///
-/// The lock fd is deliberately never closed: it's held for the process's
+/// The lock file is deliberately never closed: it's held for the process's
 /// entire lifetime and released by the kernel on exit -- including a
-/// crash -- which is exactly the semantics wanted here.
-pub fn acquire(environ: *const std.process.Environ.Map) bool {
+/// crash -- which is exactly the semantics wanted here. (Zig opens it
+/// close-on-exec, so launched apps don't inherit the lock.)
+pub fn acquire(io: Io, environ: *const std.process.Environ.Map) bool {
     var path_buf: [256]u8 = undefined;
-    const runtime_dir = environ.get("XDG_RUNTIME_DIR") orelse "/tmp";
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/zofi.lock", .{runtime_dir}) catch return true;
+    // macOS has no XDG_RUNTIME_DIR, but gives every user a private
+    // $TMPDIR instead of a shared /tmp.
+    const runtime_dir = environ.get("XDG_RUNTIME_DIR") orelse environ.get("TMPDIR") orelse "/tmp";
+    const path = std.fmt.bufPrint(&path_buf, "{s}/zofi.lock", .{std.mem.trimEnd(u8, runtime_dir, "/")}) catch return true;
 
-    const fd_raw = linux.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
-    if (linux.errno(fd_raw) != .SUCCESS) return true;
-    const fd: i32 = @intCast(fd_raw);
+    _ = Io.Dir.createFileAbsolute(io, path, .{
+        .truncate = false,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+        .permissions = .fromMode(0o600),
+    }) catch |err| return err != error.WouldBlock;
+    return true;
+}
 
-    const rc = linux.flock(fd, LOCK_EX | LOCK_NB);
-    return linux.errno(rc) == .SUCCESS;
+test "a second acquire in the same runtime dir is refused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+
+    var environ: std.process.Environ.Map = .init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("XDG_RUNTIME_DIR", dir);
+
+    try std.testing.expect(acquire(io, &environ));
+    try std.testing.expect(!acquire(io, &environ));
 }

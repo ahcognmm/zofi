@@ -37,11 +37,7 @@ pub fn main(init: std.process.Init) !void {
     var theme = theme_mod.Theme{};
     theme.show_tabs = true;
     theme.active_tab = .apps;
-    theme.font_path = (try font_mod.fcMatch(arena, io, "monospace")) orelse
-        (try font_mod.find(arena, io, &.{ "DejaVuSansMono", "Mono", "Consolas", "Menlo" })) orelse
-        (try font_mod.find(arena, io, &.{ "DejaVuSans", "Inter", "Noto", "Liberation" })) orelse
-        (try font_mod.fcMatch(arena, io, "sans-serif")) orelse
-        (try font_mod.findAny(arena, io));
+    theme.font_path = try font_mod.findDefault(arena, io);
     state.visible_rows = theme.visibleRows();
 
     for ([_]f64{ 1, 2 }) |scale| {
