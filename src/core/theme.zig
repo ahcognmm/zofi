@@ -25,7 +25,7 @@ pub const icon_palette = [_]z2d.Pixel{
     hex(0x7A3F55), // maroon/rose
 };
 
-pub const Tab = enum { apps, run, windows };
+pub const Tab = enum { apps, run, windows, clipboard };
 
 pub const Theme = struct {
     // Mode chrome (not shown in dmenu mode)
@@ -48,7 +48,7 @@ pub const Theme = struct {
     dashboard_enabled: bool = false,
 
     // Panel
-    panel_width: f64 = 640,
+    panel_width: f64 = 840,
     panel_height: f64 = 516, // fixed, never jumps regardless of result count
     corner_radius: f64 = 14,
     border_width: f64 = 1,
@@ -141,6 +141,17 @@ pub const Theme = struct {
     icon_tile_size: f64 = 28,
     icon_tile_radius: f64 = 7,
     icon_letter_size: f64 = 13,
+
+    // Clipboard tab: split list + preview pane (zofi-clipboard.html).
+    // Rows reuse `row_height_tall`/`icon_tile_size` above (the mockup's
+    // 48px row height and 28px tile match those exactly); these are the
+    // pane-specific numbers on top of that.
+    clip_list_w: f64 = 300, // .list width
+    clip_gap: f64 = 12, // gap either side of the vertical rule
+    clip_stage_h: f64 = 196, // .stage height
+    clip_preview_gap: f64 = 14, // .preview gap (between stage and meta list)
+    clip_meta_gap: f64 = 8, // .meta gap (between dt/dd rows)
+    clip_meta_font_size: f64 = 12.5,
 
     // Footer
     footer_height: f64 = 34,

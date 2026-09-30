@@ -1,0 +1,25 @@
+# Clipboard-history listener for zofi's `-show clipboard` tab.
+#
+# Install (assumes `zig build` has already put the `zofi` binary on PATH,
+# e.g. via `zig build -p ~/.local` or a distro package):
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/systemd/zofi-clipboard.service ~/.config/systemd/user/
+#   systemctl --user enable --now zofi-clipboard.service
+#
+# History lives in $XDG_CACHE_HOME/zofi/clipboard.db (~/.cache/zofi by
+# default), capped at 50MB, oldest entries evicted first -- see
+# src/core/clipboard.zig.
+
+[Unit]
+Description=zofi clipboard history daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/zofi --clipboard-daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

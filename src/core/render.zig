@@ -18,6 +18,7 @@ const icon_mod = @import("icon.zig");
 const dashboard_mod = @import("dashboard.zig");
 const history_mod = @import("history.zig");
 const weather_mod = @import("weather.zig");
+const clipboard_mod = @import("clipboard.zig");
 const ui = @import("ui/root.zig");
 const L = ui.layout;
 const shapes = ui.shapes;
@@ -45,6 +46,7 @@ pub fn render(
     scale: f64,
     icon_cache: ?*icon_mod.Cache,
     environ: ?*const std.process.Environ.Map,
+    clip_preview: ?*clipboard_mod.PreviewCache,
 ) !void {
     var ctx = z2d.Context.init(io, alloc, surface);
     defer ctx.deinit();
@@ -76,6 +78,8 @@ pub fn render(
     // page, never a replacement for "here are your open windows".
     if (theme.dashboard_enabled and theme.active_tab == .apps and state.query.items.len == 0) {
         try drawDashboard(&ctx, surface, theme, io, alloc, environ, icon_cache, width, padding, rows_top, footer_y, scale);
+    } else if (theme.active_tab == .clipboard) {
+        try drawClipboardSplit(&ctx, surface, theme, state, io, alloc, environ, clip_preview, width, padding, rows_top, footer_y, scale);
     } else {
         try drawRows(&ctx, surface, theme, state, width, padding, rows_top, scale, icon_cache);
     }
@@ -181,7 +185,7 @@ fn drawPrompt(ctx: *z2d.Context, theme: *const Theme, state: *State, width: f64,
 }
 
 fn drawTabs(ctx: *z2d.Context, theme: *const Theme, width: f64, padding: f64, prompt_h: f64, scale: f64) !void {
-    const labels = [_][]const u8{ "Apps", "Run", "Windows" };
+    const labels = [_][]const u8{ "Apps", "Run", "Windows", "Clipboard" };
     const chip_fs = theme.mode_chip_font_size * scale;
     const chip_pad_x = theme.mode_chip_pad_x * scale;
     const chip_h = theme.mode_chip_height * scale;
@@ -214,6 +218,7 @@ fn drawTabs(ctx: *z2d.Context, theme: *const Theme, width: f64, padding: f64, pr
         .apps => 0,
         .run => 1,
         .windows => 2,
+        .clipboard => 3,
     };
 
     for (labels, 0..) |l, i| {
@@ -259,6 +264,325 @@ fn drawRows(ctx: *z2d.Context, surface: *z2d.Surface, theme: *const Theme, state
         } else {
             try drawTallRow(ctx, surface, theme, state, entry, result.index, row_y, row_h, width, padding, row_pad_x, font_size, char_w, scale, selected, icon_cache);
         }
+    }
+}
+
+/// Split-pane clipboard tab (see `zofi-clipboard.html`): a narrower
+/// history list on the left, a 1px rule, and a preview pane on the right
+/// for the selected entry's full content. The list column reuses
+/// `drawTallRow` outright (tile + title, same 48px row height as
+/// Apps/Windows) by handing it the list column's own right edge as its
+/// `width` -- that function's tile/text-truncation math is already
+/// expressed purely in terms of `width`/`padding`, so a narrower `width`
+/// shrinks it correctly with no changes to `drawTallRow` itself. Row
+/// tiles are the plain letter fallback, not per-kind colored glyphs like
+/// the mockup -- this renderer has no vector/SVG icon drawing (see
+/// `icon.zig`'s doc comment on why only PNG-backed icons are supported at
+/// all), and kind-specific treatment is reserved for the preview pane,
+/// which is the actual point of this tab.
+fn drawClipboardSplit(
+    ctx: *z2d.Context,
+    surface: *z2d.Surface,
+    theme: *const Theme,
+    state: *State,
+    io: Io,
+    alloc: std.mem.Allocator,
+    environ: ?*const std.process.Environ.Map,
+    clip_preview: ?*clipboard_mod.PreviewCache,
+    width: f64,
+    padding: f64,
+    content_top: f64,
+    content_bottom: f64,
+    scale: f64,
+) !void {
+    if (state.results.items.len == 0) {
+        try drawClipboardEmpty(ctx, theme, state, width, content_top, content_bottom - content_top, scale);
+        return;
+    }
+
+    const list_w = theme.clip_list_w * scale;
+    const gap = theme.clip_gap * scale;
+    const vrule_w = @max(1.0, scale);
+    const list_right = padding + list_w;
+    const preview_x = list_right + gap + vrule_w + gap;
+    const preview_w = @max(0.0, (width - padding) - preview_x);
+
+    const row_h = theme.row_height_tall * scale;
+    const row_gap = theme.list_row_gap * scale;
+    const row_pad_x = theme.row_pad_x * scale;
+    const name_fs = theme.name_font_size * scale;
+    const char_w = Theme.charWidth(name_fs);
+    const visible = @min(state.visible_rows, state.results.items.len -| state.scroll);
+
+    for (0..visible) |row_i| {
+        const result_i = state.scroll + row_i;
+        const result = state.results.items[result_i];
+        const entry = state.entryAt(result.index);
+        const row_y = content_top + @as(f64, @floatFromInt(row_i)) * (row_h + row_gap);
+        const selected = result_i == state.selected;
+
+        if (selected) {
+            ctx.setSourceToPixel(theme.selected);
+            try shapes.roundedRect(ctx, padding * 0.5, row_y, list_w, row_h, theme.row_radius * scale);
+            try ctx.fill();
+            ctx.resetPath();
+        }
+
+        try drawTallRow(ctx, surface, theme, state, entry, result.index, row_y, row_h, list_right, padding, row_pad_x, name_fs, char_w, scale, selected, null);
+    }
+
+    ctx.setSourceToPixel(theme.border);
+    try shapes.fillRect(ctx, list_right + gap, content_top + 2 * scale, vrule_w, (content_bottom - content_top) - 4 * scale);
+    ctx.resetPath();
+
+    if (preview_w <= 0) return;
+
+    const sel_entry = state.selectedEntry() orelse return;
+    const marker = sel_entry.action orelse return;
+    const id = clipboard_mod.parseMarker(marker) catch return;
+    const cache = clip_preview orelse return;
+    const env = environ orelse return;
+    const preview = cache.get(alloc, io, env, id) orelse return;
+
+    try drawClipboardPreview(ctx, surface, theme, preview, preview_x, content_top, preview_w, scale);
+}
+
+fn drawClipboardEmpty(ctx: *z2d.Context, theme: *const Theme, state: *State, width: f64, content_top: f64, content_h: f64, scale: f64) !void {
+    const has_query = state.query.items.len > 0;
+    const title = if (has_query) "No matches" else "Clipboard history is empty";
+    const sub = if (has_query) "Try fewer letters, or press Esc to clear." else "Copy something and it shows up here.";
+
+    const title_fs = theme.name_font_size * scale;
+    const sub_fs = theme.subtitle_font_size * scale;
+    const title_label: Label = .{ .text = title, .font_size = title_fs, .color = theme.text };
+    const sub_label: Label = .{ .text = sub, .font_size = sub_fs, .color = theme.dim };
+
+    const cy = content_top + content_h / 2;
+    try title_label.draw(ctx, .{ .x = (width - title_label.width()) / 2, .y = cy - title_fs });
+    try sub_label.draw(ctx, .{ .x = (width - sub_label.width()) / 2, .y = cy + 4 * scale });
+}
+
+fn drawClipboardPreview(
+    ctx: *z2d.Context,
+    surface: *z2d.Surface,
+    theme: *const Theme,
+    preview: clipboard_mod.Preview,
+    x: f64,
+    y: f64,
+    w: f64,
+    scale: f64,
+) !void {
+    const stage_h = theme.clip_stage_h * scale;
+    const radius = theme.dash_card_radius * scale;
+
+    switch (preview.kind) {
+        .image => try drawImageStage(ctx, surface, theme, preview, x, y, w, stage_h, radius, scale),
+        .color => try drawColorStage(ctx, theme, preview, x, y, w, stage_h, radius, scale),
+        .link, .text => try drawTextStage(ctx, theme, preview, x, y, w, stage_h, radius, scale),
+    }
+
+    const meta_y = y + stage_h + theme.clip_preview_gap * scale;
+    try drawClipboardMeta(ctx, theme, preview, x, meta_y, w, scale);
+}
+
+fn drawImageStage(
+    ctx: *z2d.Context,
+    surface: *z2d.Surface,
+    theme: *const Theme,
+    preview: clipboard_mod.Preview,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    radius: f64,
+    scale: f64,
+) !void {
+    // No checkerboard-transparency backdrop like the mockup's `.stage.image`
+    // -- that's a procedural per-pixel fill for something purely
+    // decorative; a plain card background reads fine here.
+    ctx.setSourceToPixel(theme.dash_card_bg);
+    try shapes.roundedRect(ctx, x, y, w, h, radius);
+    try ctx.fill();
+    ctx.resetPath();
+
+    const img = preview.image orelse {
+        const label: Label = .{ .text = "Image preview unavailable", .font_size = theme.subtitle_font_size * scale, .color = theme.faint };
+        try label.draw(ctx, .{ .x = x + (w - label.width()) / 2, .y = y + h / 2 });
+        return;
+    };
+    if (preview.img_width == 0 or preview.img_height == 0) return;
+
+    const iw: f64 = @floatFromInt(preview.img_width);
+    const ih: f64 = @floatFromInt(preview.img_height);
+    const pad = 12 * scale;
+    const avail_w = @max(1.0, w - pad * 2);
+    const avail_h = @max(1.0, h - pad * 2);
+    const fit = @min(avail_w / iw, avail_h / ih);
+    const dw = iw * fit;
+    const dh = ih * fit;
+
+    (Image{ .icon = img }).draw(surface, .{ .x = x + (w - dw) / 2, .y = y + (h - dh) / 2, .w = dw, .h = dh });
+}
+
+fn drawColorStage(
+    ctx: *z2d.Context,
+    theme: *const Theme,
+    preview: clipboard_mod.Preview,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    radius: f64,
+    scale: f64,
+) !void {
+    const trimmed = std.mem.trim(u8, preview.text, " \t\r\n");
+    const rgb = clipboard_mod.parseHexColor(trimmed) orelse clipboard_mod.Rgb{ .r = 0, .g = 0, .b = 0 };
+    const pixel: z2d.Pixel = .{ .rgba = (z2d.pixel.RGBA{ .r = rgb.r, .g = rgb.g, .b = rgb.b, .a = 255 }).multiply() };
+
+    ctx.setSourceToPixel(pixel);
+    try shapes.roundedRect(ctx, x, y, w, h, radius);
+    try ctx.fill();
+    ctx.resetPath();
+
+    // Small hex-text chip, bottom-left -- mirrors the mockup's
+    // `.stage.swatch span`.
+    const chip_fs = theme.clip_meta_font_size * scale;
+    const chip_label: Label = .{ .text = trimmed, .font_size = chip_fs, .color = theme.text };
+    const chip_pad_x = 8 * scale;
+    const chip_pad_y = 5 * scale;
+    const chip_w = chip_label.width() + chip_pad_x * 2;
+    const chip_h = chip_fs + chip_pad_y * 2;
+    const chip_x = x + 12 * scale;
+    const chip_y = y + h - chip_h - 12 * scale;
+
+    ctx.setSourceToPixel(theme.panel_bg);
+    try shapes.roundedRect(ctx, chip_x, chip_y, chip_w, chip_h, 5 * scale);
+    try ctx.fill();
+    ctx.resetPath();
+    try chip_label.draw(ctx, .{ .x = chip_x + chip_pad_x, .y = chip_y + chip_pad_y });
+}
+
+/// A byte index one `snapUtf8Boundary` call away from `at` guarantees a
+/// truncation point never lands mid-codepoint -- used by `drawTextStage`'s
+/// naive wrapping (fixed chars-per-line, not real text shaping) so it
+/// can't split e.g. a curly quote or emoji across two lines into tofu.
+fn snapUtf8Boundary(bytes: []const u8, at: usize) usize {
+    var i = at;
+    while (i > 0 and i < bytes.len and (bytes[i] & 0xC0) == 0x80) i -= 1;
+    return i;
+}
+
+fn drawTextStage(
+    ctx: *z2d.Context,
+    theme: *const Theme,
+    preview: clipboard_mod.Preview,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    radius: f64,
+    scale: f64,
+) !void {
+    ctx.setSourceToPixel(theme.dash_card_bg);
+    try shapes.roundedRect(ctx, x, y, w, h, radius);
+    try ctx.fill();
+    ctx.resetPath();
+
+    const pad = 14 * scale;
+    const fs = theme.compact_font_size * scale;
+    const char_w = Theme.charWidth(fs);
+    const line_h = fs * 1.55;
+    const max_chars: usize = if (char_w > 0) @intFromFloat(@max(0.0, (w - pad * 2) / char_w)) else 0;
+    const max_lines: usize = if (line_h > 0) @intFromFloat(@max(0.0, (h - pad * 2) / line_h)) else 0;
+    if (max_chars == 0 or max_lines == 0) return;
+
+    var line_y = y + pad;
+    var lines_drawn: usize = 0;
+    var it = std.mem.splitScalar(u8, preview.text, '\n');
+    outer: while (it.next()) |raw_line| {
+        var rest = raw_line;
+        while (true) {
+            if (lines_drawn >= max_lines) break :outer;
+            var take = @min(max_chars, rest.len);
+            if (take < rest.len) take = snapUtf8Boundary(rest, take);
+            if (take == 0) take = @min(max_chars, rest.len);
+            const chunk = rest[0..take];
+            try (Label{ .text = chunk, .font_size = fs, .color = theme.text }).draw(ctx, .{ .x = x + pad, .y = line_y });
+            line_y += line_h;
+            lines_drawn += 1;
+            rest = rest[take..];
+            if (rest.len == 0) break;
+        }
+    }
+}
+
+fn drawClipboardMeta(
+    ctx: *z2d.Context,
+    theme: *const Theme,
+    preview: clipboard_mod.Preview,
+    x: f64,
+    y: f64,
+    w: f64,
+    scale: f64,
+) !void {
+    const fs = theme.clip_meta_font_size * scale;
+    const gap = theme.clip_meta_gap * scale;
+
+    var age_buf: [32]u8 = undefined;
+    const time_c = @cImport({
+        @cInclude("time.h");
+    });
+    const now: i64 = @intCast(time_c.time(null));
+    const age = clipboard_mod.formatAge(&age_buf, now, preview.created_at);
+
+    var buf1: [64]u8 = undefined;
+    var buf2: [64]u8 = undefined;
+
+    const Row = struct { dt: []const u8, dd: []const u8 };
+    var rows: [4]Row = undefined;
+    var n: usize = 0;
+
+    switch (preview.kind) {
+        .image => {
+            rows[0] = .{ .dt = "Format", .dd = clipboard_mod.mimeShortName(preview.mime) };
+            rows[1] = .{ .dt = "Size", .dd = std.fmt.bufPrint(&buf1, "{d} x {d} px", .{ preview.img_width, preview.img_height }) catch "" };
+            rows[2] = .{ .dt = "File", .dd = std.fmt.bufPrint(&buf2, "{d} KB", .{@divTrunc(preview.size_bytes, 1024)}) catch "" };
+            rows[3] = .{ .dt = "Copied", .dd = age };
+            n = 4;
+        },
+        .color => {
+            const trimmed = std.mem.trim(u8, preview.text, " \t\r\n");
+            const rgb = clipboard_mod.parseHexColor(trimmed) orelse clipboard_mod.Rgb{ .r = 0, .g = 0, .b = 0 };
+            const hsl = clipboard_mod.rgbToHsl(rgb.r, rgb.g, rgb.b);
+            rows[0] = .{ .dt = "Hex", .dd = trimmed };
+            rows[1] = .{ .dt = "RGB", .dd = std.fmt.bufPrint(&buf1, "{d}, {d}, {d}", .{ rgb.r, rgb.g, rgb.b }) catch "" };
+            rows[2] = .{ .dt = "HSL", .dd = std.fmt.bufPrint(&buf2, "{d:.0}\xC2\xB0, {d:.0}%, {d:.0}%", .{ hsl.h, hsl.s * 100, hsl.l * 100 }) catch "" };
+            rows[3] = .{ .dt = "Copied", .dd = age };
+            n = 4;
+        },
+        .link => {
+            const trimmed = std.mem.trim(u8, preview.text, " \t\r\n");
+            rows[0] = .{ .dt = "Domain", .dd = clipboard_mod.urlDomain(trimmed) };
+            rows[1] = .{ .dt = "Characters", .dd = std.fmt.bufPrint(&buf1, "{d}", .{preview.text.len}) catch "" };
+            rows[2] = .{ .dt = "Copied", .dd = age };
+            n = 3;
+        },
+        .text => {
+            const lines = std.mem.count(u8, preview.text, "\n") + 1;
+            rows[0] = .{ .dt = "Characters", .dd = std.fmt.bufPrint(&buf1, "{d}", .{preview.text.len}) catch "" };
+            rows[1] = .{ .dt = "Lines", .dd = std.fmt.bufPrint(&buf2, "{d}", .{lines}) catch "" };
+            rows[2] = .{ .dt = "Copied", .dd = age };
+            n = 3;
+        },
+    }
+
+    var row_y = y;
+    for (rows[0..n]) |row| {
+        const dt_label: Label = .{ .text = row.dt, .font_size = fs, .color = theme.dim };
+        const dd_label: Label = .{ .text = row.dd, .font_size = fs, .color = theme.text };
+        try dt_label.draw(ctx, .{ .x = x, .y = row_y });
+        try dd_label.draw(ctx, .{ .x = x + w - dd_label.width(), .y = row_y });
+        row_y += fs + gap;
     }
 }
 
@@ -633,8 +957,16 @@ fn clipCentered(label: Label, avail_w: f64) Label {
     const char_w = Theme.charWidth(label.font_size);
     const max_chars: usize = if (char_w > 0) @intFromFloat(@max(0.0, avail_w / char_w)) else 0;
     if (max_chars > 1 and label.text.len > max_chars) {
+        // Walk codepoints rather than slicing at a raw byte offset -- see
+        // matched_text.zig's `draw` for why (non-ASCII text can otherwise
+        // get cut mid-sequence and crash z2d's `showText`).
+        var end: usize = 0;
+        var count: usize = 0;
+        while (end < label.text.len and count < max_chars - 1) : (count += 1) {
+            end += std.unicode.utf8ByteSequenceLength(label.text[end]) catch 1;
+        }
         var clipped = label;
-        clipped.text = label.text[0 .. max_chars - 1];
+        clipped.text = label.text[0..end];
         return clipped;
     }
     return label;
@@ -722,7 +1054,7 @@ fn drawCompactRow(
 
     var right_text: ?[]const u8 = null;
     if (entry.action) |a| {
-        if (!std.mem.eql(u8, a, entry.label)) right_text = a;
+        if (!entry.is_clipboard_marker and !std.mem.eql(u8, a, entry.label)) right_text = a;
     }
     // Values sourced from e.g. dmenu's `-display-columns` may still carry
     // the raw separator (a tab), which has no glyph in the monospace font
@@ -839,7 +1171,10 @@ fn drawFooter(ctx: *z2d.Context, theme: *const Theme, state: *State, width: f64,
     const pad_x = theme.footer_pad_x * scale;
 
     var buf: [64]u8 = undefined;
-    const noun = if (theme.compact_rows) "commands" else "apps";
+    const noun = switch (theme.active_tab) {
+        .clipboard => "entries",
+        else => if (theme.compact_rows) "commands" else "apps",
+    };
     const status = if (state.query.items.len == 0)
         std.fmt.bufPrint(&buf, "{d} {s} \xC2\xB7 most used first", .{ state.entries.len, noun }) catch "" // "·"
     else
@@ -852,18 +1187,29 @@ fn drawFooter(ctx: *z2d.Context, theme: *const Theme, state: *State, width: f64,
     const unit_gap = 6 * scale;
 
     // Visual left-to-right order (the original right-to-left placement
-    // loop worked out to this order on screen).
+    // loop worked out to this order on screen). The clipboard tab adds a
+    // fourth cap (Del/remove) and renames Enter's label -- `caps_buf` is
+    // sized for the larger case; `caps` is whichever prefix of it applies.
     const Cap = struct { key: []const u8, label: []const u8 };
-    const caps = [_]Cap{
-        .{ .key = "Enter", .label = "open" },
-        .{ .key = "Tab", .label = "mode" },
-        .{ .key = "Esc", .label = "close" },
+    const max_caps = 4;
+    var caps_buf: [max_caps]Cap = undefined;
+    const caps: []const Cap = if (theme.active_tab == .clipboard) blk: {
+        caps_buf[0] = .{ .key = "Enter", .label = "copy" };
+        caps_buf[1] = .{ .key = "Del", .label = "remove" };
+        caps_buf[2] = .{ .key = "Tab", .label = "mode" };
+        caps_buf[3] = .{ .key = "Esc", .label = "close" };
+        break :blk caps_buf[0..4];
+    } else blk: {
+        caps_buf[0] = .{ .key = "Enter", .label = "open" };
+        caps_buf[1] = .{ .key = "Tab", .label = "mode" };
+        caps_buf[2] = .{ .key = "Esc", .label = "close" };
+        break :blk caps_buf[0..3];
     };
 
-    var label_nodes: [caps.len]L.Node = undefined;
-    var key_nodes: [caps.len]L.Node = undefined;
-    var unit_nodes: [caps.len]L.Node = undefined;
-    var unit_ptrs: [caps.len]*L.Node = undefined;
+    var label_nodes: [max_caps]L.Node = undefined;
+    var key_nodes: [max_caps]L.Node = undefined;
+    var unit_nodes: [max_caps]L.Node = undefined;
+    var unit_ptrs: [max_caps]*L.Node = undefined;
     // Named per-unit storage for each unit's children slice -- an
     // anonymous `&.{ &label_nodes[i], &key_nodes[i] }` built fresh inside
     // this loop would alias a single reused temporary across iterations,
@@ -872,7 +1218,7 @@ fn drawFooter(ctx: *z2d.Context, theme: *const Theme, state: *State, width: f64,
     // of spread across the bottom-right, since `layout()` ended up
     // recursing into the same (last-iteration) label/key nodes for all
     // three units).
-    var unit_children: [caps.len][2]*L.Node = undefined;
+    var unit_children: [max_caps][2]*L.Node = undefined;
     const caps_gap = theme.footer_caps_gap * scale;
     var caps_row_w: f64 = 0;
     for (caps, 0..) |cap, i| {
@@ -898,7 +1244,7 @@ fn drawFooter(ctx: *z2d.Context, theme: *const Theme, state: *State, width: f64,
     // of `footer_row` below, and an unset (`.auto`) main-axis size
     // resolves to 0 (see `layout.zig`'s doc comment), which pushed the
     // whole row off the right edge instead of flush against it.
-    var caps_row: L.Node = .{ .axis = .row, .gap = caps_gap, .width = .{ .fixed = caps_row_w }, .height = .{ .fixed = footer_h }, .children = &unit_ptrs };
+    var caps_row: L.Node = .{ .axis = .row, .gap = caps_gap, .width = .{ .fixed = caps_row_w }, .height = .{ .fixed = footer_h }, .children = unit_ptrs[0..caps.len] };
 
     var status_node: L.Node = .{ .width = .{ .fixed = status_label.width() }, .height = .{ .fixed = fs } };
     var footer_row: L.Node = .{

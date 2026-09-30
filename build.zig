@@ -40,6 +40,12 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zigimg", .module = zigimg.module("zigimg") },
         },
     });
+    // clipboard.zig's SQLite storage, shared by the daemon and the
+    // clipboard tab's entry source, lives in core -- needs its own
+    // link/include setup since each Zig module resolves @cImport
+    // separately (addWaylandBackend below only covers the exe module).
+    addPkgConfigIncludes(b, core_mod, &.{"sqlite3"});
+    core_mod.linkSystemLibrary("sqlite3", .{});
 
     const exe = b.addExecutable(.{
         .name = "zofi",
@@ -123,13 +129,16 @@ fn addWaylandBackend(
     const xdg_shell = scanProtocol(b, scanner, b.path("protocols/xdg-shell.xml"), "xdg-shell");
     const layer_shell = scanProtocol(b, scanner, b.path("protocols/wlr-layer-shell-unstable-v1.xml"), "wlr-layer-shell-unstable-v1");
     const foreign_toplevel = scanProtocol(b, scanner, b.path("protocols/wlr-foreign-toplevel-management-unstable-v1.xml"), "wlr-foreign-toplevel-management-unstable-v1");
+    const data_control = scanProtocol(b, scanner, b.path("protocols/wlr-data-control-unstable-v1.xml"), "wlr-data-control-unstable-v1");
 
     mod.addCSourceFile(.{ .file = xdg_shell.code, .flags = &.{} });
     mod.addCSourceFile(.{ .file = layer_shell.code, .flags = &.{} });
     mod.addCSourceFile(.{ .file = foreign_toplevel.code, .flags = &.{} });
+    mod.addCSourceFile(.{ .file = data_control.code, .flags = &.{} });
     mod.addIncludePath(xdg_shell.header.dirname());
     mod.addIncludePath(layer_shell.header.dirname());
     mod.addIncludePath(foreign_toplevel.header.dirname());
+    mod.addIncludePath(data_control.header.dirname());
 
     _ = target;
 }

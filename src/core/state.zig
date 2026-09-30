@@ -19,6 +19,12 @@ pub const Entry = struct {
     /// for a URL-shaped query. Callers use it to decide whether `action` is
     /// a URL to hand to a browser rather than a command to run as-is.
     is_url: bool = false,
+    /// True only for clipboard-tab rows (see `sources/clipboard.zig`):
+    /// `action` there is a `"clipboard:<id>"` marker for `main.zig`'s
+    /// `core.clipboard.copyToClipboard`, not literal text, so
+    /// `render.zig`'s compact row must not show it as secondary text the
+    /// way it would for e.g. Run mode's real command path.
+    is_clipboard_marker: bool = false,
 };
 
 pub const Result = struct {
