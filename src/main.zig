@@ -197,6 +197,11 @@ fn printUsage(io: Io) !void {
         \\  ZOFI_BROWSER=cmd  Browser used to open URL-shaped queries (default: firefox;
         \\                    on macOS, `open`, i.e. the default browser)
         \\  TERMINAL=cmd      Terminal used to launch terminal .desktop entries
+        \\  ZOFI_CLIPBOARD_MAX_MB=N    Clipboard history size limit, oldest
+        \\                             evicted first (default: 50, 1-4096)
+        \\  ZOFI_CLIPBOARD_POLL_MS=N   macOS only: how often the clipboard
+        \\                             daemon checks for a new copy
+        \\                             (default: 500, 100-10000)
         \\
         \\Clipboard history (-show clipboard) needs a background listener
         \\running: zofi --clipboard-daemon, normally started once via

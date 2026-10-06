@@ -420,7 +420,10 @@ pub fn copyToClipboard(allocator: std.mem.Allocator, io: Io, environ: *const std
 // this polls NSPasteboard's change counter -- the same approach every
 // macOS clipboard manager takes.
 
-const poll_interval_ms = 500;
+/// How often to check for a new copy. Override with
+/// `ZOFI_CLIPBOARD_POLL_MS` (100-10000): lower catches copies made in quick
+/// succession, higher wakes the Mac less often.
+const default_poll_ms: u32 = 500;
 
 const DaemonCtx = struct {
     allocator: std.mem.Allocator,
@@ -431,6 +434,7 @@ const DaemonCtx = struct {
 pub fn runClipboardDaemon(allocator: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, debug: bool) !void {
     var db = try core.clipboard.open(allocator, io, environ);
     defer db.close();
+    const poll_ms = core.env.int(u32, environ, "ZOFI_CLIPBOARD_POLL_MS", default_poll_ms, 100, 10_000);
 
     // Per-change scratch memory, reset every time: this process runs for
     // days, and `allocator` is main's never-freed arena.
@@ -441,7 +445,7 @@ pub fn runClipboardDaemon(allocator: std.mem.Allocator, io: Io, environ: *const 
     // the Wayland daemon does when the compositor sends the current
     // selection on bind.
     var last_count: i64 = -1;
-    if (debug) std.debug.print("clipboard daemon: polling every {d}ms\n", .{poll_interval_ms});
+    if (debug) std.debug.print("clipboard daemon: polling every {d}ms, keeping up to {d}MB\n", .{ poll_ms, @divTrunc(db.cap_bytes, 1024 * 1024) });
     while (true) {
         const count = c.zofi_mac_pasteboard_change_count();
         if (count != last_count) {
@@ -452,7 +456,7 @@ pub fn runClipboardDaemon(allocator: std.mem.Allocator, io: Io, environ: *const 
                 std.debug.print("clipboard daemon: change {d} has nothing to keep\n", .{count});
             }
         }
-        try Io.sleep(io, .fromMilliseconds(poll_interval_ms), .awake);
+        try Io.sleep(io, .fromMilliseconds(poll_ms), .awake);
     }
 }
 

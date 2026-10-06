@@ -8,6 +8,7 @@ pub const font = @import("font.zig");
 pub const icon = @import("icon.zig");
 pub const launch = @import("launch.zig");
 pub const mode = @import("mode.zig");
+pub const env = @import("env.zig");
 pub const singleton = @import("singleton.zig");
 pub const dashboard = @import("dashboard.zig");
 pub const history = @import("history.zig");
@@ -38,6 +39,7 @@ test {
     _ = icon;
     _ = launch;
     _ = mode;
+    _ = env;
     _ = singleton;
     _ = dashboard;
     _ = history;
