@@ -112,30 +112,7 @@ pub const App = struct {
     clipboard_preview: core.clipboard.PreviewCache = .{},
 };
 
-pub const LauncherMode = enum {
-    drun,
-    run,
-    windows,
-    clipboard,
-
-    fn next(self: LauncherMode) LauncherMode {
-        return switch (self) {
-            .drun => .run,
-            .run => .windows,
-            .windows => .clipboard,
-            .clipboard => .drun,
-        };
-    }
-
-    fn prev(self: LauncherMode) LauncherMode {
-        return switch (self) {
-            .drun => .clipboard,
-            .run => .drun,
-            .windows => .run,
-            .clipboard => .windows,
-        };
-    }
-};
+pub const LauncherMode = core.mode.LauncherMode;
 
 /// Logs to stderr when `ZOFI_DEBUG` is set, so a hang/freeze can be
 /// diagnosed from what the log stops after, not guessed at. No-op (and the
@@ -1033,6 +1010,13 @@ fn buildWindowEntries(app: *App) ![]core.state.Entry {
 // Deliberately its own minimal connect/registry/dispatch loop rather than
 // reusing App/eventLoop above: there's no surface to configure, no frames
 // to present, and nothing else to poll for.
+
+/// Puts a clipboard-history entry (`"clipboard:<id>"` marker) back on the
+/// system clipboard. Same entry point name as the macOS backend's, so
+/// main.zig doesn't need to know which clipboard it's talking to.
+pub fn copyToClipboard(allocator: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, marker: []const u8) !void {
+    return core.clipboard.copyToClipboard(allocator, io, environ, marker);
+}
 
 const ClipboardDaemon = struct {
     allocator: std.mem.Allocator,

@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Clipboard-history listener for zofi's `-show clipboard` tab on macOS
+  (the launchd counterpart of contrib/systemd/zofi-clipboard.service).
+
+  Install (assumes `zig build -p ~/.local` put the binary at ~/.local/bin/zofi;
+  launchd doesn't expand ~ or $HOME, so fix the path below to match first):
+
+    cp contrib/launchd/com.github.zofi.clipboard.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.github.zofi.clipboard.plist
+
+  Remove with:
+
+    launchctl bootout gui/$(id -u)/com.github.zofi.clipboard
+
+  History lives in $XDG_CACHE_HOME/zofi/clipboard.db (~/.cache/zofi by
+  default), capped at 50MB, oldest entries evicted first. Items that
+  password managers mark as concealed are never stored.
+
+  Tuning (the EnvironmentVariables block below; edit, then bootout and
+  bootstrap again):
+    ZOFI_CLIPBOARD_POLL_MS  how often to check for a new copy
+                            (default 500, allowed 100-10000)
+    ZOFI_CLIPBOARD_MAX_MB   history size limit (default 50, allowed 1-4096).
+                            `zofi -show clipboard` reads it too, so set it in
+                            your shell as well if you change it.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.github.zofi.clipboard</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOU/.local/bin/zofi</string>
+        <string>--clipboard-daemon</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ZOFI_CLIPBOARD_POLL_MS</key>
+        <string>500</string>
+        <key>ZOFI_CLIPBOARD_MAX_MB</key>
+        <string>50</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

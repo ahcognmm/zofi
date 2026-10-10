@@ -126,16 +126,20 @@ fn fileAgeSeconds(io: Io, path: []const u8) ?i64 {
     return now - mtime_s;
 }
 
-/// Kicks off a background refresh (detached, self-reexec via
-/// `/proc/self/exe`) if the cache is missing or older than 30 minutes.
-/// Never blocks: the *next* launch is what sees the updated data.
+/// Kicks off a background refresh (detached re-exec of this same binary)
+/// if the cache is missing or older than 30 minutes. Never blocks: the
+/// *next* launch is what sees the updated data.
 pub fn maybeRefresh(allocator: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map) void {
     const path = weatherPath(allocator, environ) orelse return;
     const age = fileAgeSeconds(io, path);
     if (age) |a| if (a < refresh_interval_s) return;
 
+    // Not "/proc/self/exe": macOS has no procfs.
+    var exe_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const exe_len = std.process.executablePath(io, &exe_buf) catch return;
+
     _ = std.process.spawn(io, .{
-        .argv = &.{ "/proc/self/exe", "--internal-refresh-weather" },
+        .argv = &.{ exe_buf[0..exe_len], "--internal-refresh-weather" },
         .environ_map = environ,
         .stdin = .ignore,
         .stdout = .ignore,

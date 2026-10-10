@@ -9,7 +9,8 @@
 #
 # History lives in $XDG_CACHE_HOME/zofi/clipboard.db (~/.cache/zofi by
 # default), capped at 50MB, oldest entries evicted first -- see
-# src/core/clipboard.zig.
+# src/core/clipboard.zig. To change the cap, uncomment the Environment=
+# line below (1-4096; also set it where you run `zofi -show clipboard`).
 
 [Unit]
 Description=zofi clipboard history daemon
@@ -18,6 +19,7 @@ PartOf=graphical-session.target
 
 [Service]
 ExecStart=%h/.local/bin/zofi --clipboard-daemon
+#Environment=ZOFI_CLIPBOARD_MAX_MB=50
 Restart=on-failure
 RestartSec=2
 

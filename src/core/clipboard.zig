@@ -10,16 +10,20 @@ const Io = std.Io;
 const z2d = @import("z2d");
 const zigimg = @import("zigimg");
 const icon_mod = @import("icon.zig");
+const env = @import("env.zig");
 
 const c = @cImport({
     @cInclude("sqlite3.h");
 });
 
-/// Evict oldest entries once total stored content exceeds this.
-pub const cap_bytes: i64 = 50 * 1024 * 1024;
+/// Evict oldest entries once total stored content exceeds this many MB.
+/// Override with `ZOFI_CLIPBOARD_MAX_MB` (1-4096).
+pub const default_cap_mb: i64 = 50;
 
 pub const Db = struct {
     handle: *c.sqlite3,
+    /// Size limit `insert` evicts down to; see `default_cap_mb`.
+    cap_bytes: i64 = default_cap_mb * 1024 * 1024,
 
     pub fn close(self: *Db) void {
         _ = c.sqlite3_close(self.handle);
@@ -89,7 +93,9 @@ pub fn openAt(allocator: std.mem.Allocator, io: Io, path: []const u8) !Db {
 pub fn open(allocator: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map) !Db {
     const dir = try cacheDir(allocator, environ);
     const path = try std.fs.path.join(allocator, &.{ dir, "clipboard.db" });
-    return openAt(allocator, io, path);
+    var db = try openAt(allocator, io, path);
+    db.cap_bytes = env.int(i64, environ, "ZOFI_CLIPBOARD_MAX_MB", default_cap_mb, 1, 4096) * 1024 * 1024;
+    return db;
 }
 
 /// Id of any existing entry with this exact content hash, anywhere in
@@ -189,7 +195,7 @@ pub fn mimeShortName(mime: []const u8) []const u8 {
 }
 
 /// Deletes oldest-first until total stored `size` is back under
-/// `cap_bytes`.
+/// `db.cap_bytes`.
 fn enforceCap(db: Db) !void {
     while (true) {
         var sum_stmt: ?*c.sqlite3_stmt = null;
@@ -198,7 +204,7 @@ fn enforceCap(db: Db) !void {
         const total = c.sqlite3_column_int64(sum_stmt, 0);
         _ = c.sqlite3_finalize(sum_stmt);
 
-        if (total <= cap_bytes) return;
+        if (total <= db.cap_bytes) return;
 
         if (c.sqlite3_exec(db.handle, "DELETE FROM entries WHERE id = (SELECT MIN(id) FROM entries)", null, null, null) != c.SQLITE_OK) {
             return error.SqliteDeleteFailed;
